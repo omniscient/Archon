@@ -155,8 +155,12 @@ interface WorkflowLevelOptions {
   sandbox?: SandboxSettings;
 }
 
-/** Internal node execution result — extends NodeOutput with cost data for aggregation. */
-type NodeExecutionResult = NodeOutput & { costUsd?: number };
+/** Internal node execution result — extends NodeOutput with cost/token data for aggregation. */
+type NodeExecutionResult = NodeOutput & {
+  costUsd?: number;
+  tokens?: TokenUsage;
+  modelUsage?: Record<string, unknown>;
+};
 
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
 const lastNodeCancelCheck = new Map<string, number>();
@@ -1171,6 +1175,7 @@ async function executeNodeInternal(
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
+          ...(nodeTokens ? { tokens: nodeTokens } : {}),
         },
       })
       .catch((err: Error) => {
@@ -1200,6 +1205,8 @@ async function executeNodeInternal(
       output: nodeOutputText,
       sessionId: newSessionId,
       costUsd: nodeCostUsd,
+      tokens: nodeTokens,
+      modelUsage: nodeModelUsage,
     };
   } catch (error) {
     const err = error as Error;
@@ -2533,9 +2540,11 @@ export async function executeDagWorkflow(
   // Session threading: for sequential single-node layers, thread the session forward.
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;
-  // Note: accumulates cost for this invocation only. If this is a resume, nodes skipped
-  // from the prior run are not included — total_cost_usd will reflect resumed-portion cost only.
+  // Note: accumulates cost/tokens for this invocation only. If this is a resume, nodes skipped
+  // from the prior run are not included — totals will reflect resumed-portion only.
   let totalCostUsd = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -2967,6 +2976,10 @@ export async function executeDagWorkflow(
       if (result.status === 'fulfilled') {
         const { nodeId, output } = result.value;
         if (output.costUsd !== undefined) totalCostUsd += output.costUsd;
+        if (output.tokens) {
+          totalInputTokens += output.tokens.input ?? 0;
+          totalOutputTokens += output.tokens.output ?? 0;
+        }
         nodeOutputs.set(nodeId, output);
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
@@ -3128,8 +3141,9 @@ export async function executeDagWorkflow(
   try {
     await deps.store.completeWorkflowRun(workflowRun.id, {
       node_counts: nodeCounts,
-      // totalCostUsd starts at 0; only write metadata when at least one node reported cost
       ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+      ...(totalInputTokens > 0 ? { total_input_tokens: totalInputTokens } : {}),
+      ...(totalOutputTokens > 0 ? { total_output_tokens: totalOutputTokens } : {}),
     });
   } catch (dbErr) {
     getLog().error(
@@ -3156,7 +3170,12 @@ export async function executeDagWorkflow(
     .createWorkflowEvent({
       workflow_run_id: workflowRun.id,
       event_type: 'workflow_completed',
-      data: { duration_ms: duration },
+      data: {
+        duration_ms: duration,
+        ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
+        ...(totalInputTokens > 0 ? { total_input_tokens: totalInputTokens } : {}),
+        ...(totalOutputTokens > 0 ? { total_output_tokens: totalOutputTokens } : {}),
+      },
     })
     .catch((err: Error) => {
       getLog().error(

@@ -50,6 +50,7 @@ import {
   workflowRejectCommand,
   workflowCleanupCommand,
   workflowEventEmitCommand,
+  workflowCostCommand,
   isValidEventType,
 } from './commands/workflow';
 import { WORKFLOW_EVENT_TYPES } from '@archon/workflows/store';
@@ -99,6 +100,7 @@ Commands:
   workflow list              List available workflows in current directory
   workflow run <name> [msg]  Run a workflow with optional message
   workflow status            Show status of running workflows
+  workflow cost [run-id]     Show per-node cost/token breakdown (default: last run)
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
@@ -208,6 +210,7 @@ async function main(): Promise<number> {
         'download-only': { type: 'boolean' },
         scope: { type: 'string' },
         force: { type: 'boolean' },
+        format: { type: 'string' },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -475,6 +478,14 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'cost': {
+            const costRunId = positionals[2] ?? '--last';
+            const costFormat =
+              (values.format as string | undefined) ?? (jsonFlag ? 'json' : undefined) ?? 'table';
+            await workflowCostCommand(costRunId, costFormat as 'table' | 'markdown' | 'json');
+            break;
+          }
+
           default:
             if (subcommand === undefined) {
               console.error('Missing workflow subcommand');
@@ -482,7 +493,7 @@ async function main(): Promise<number> {
               console.error(`Unknown workflow subcommand: ${subcommand}`);
             }
             console.error(
-              'Available: list, run, status, resume, abandon, approve, reject, cleanup, event'
+              'Available: list, run, status, resume, abandon, approve, reject, cleanup, event, cost'
             );
             return 1;
         }

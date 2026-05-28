@@ -1127,3 +1127,182 @@ export async function workflowEventEmitCommand(
   // have been persisted if the DB was unavailable. Check server logs if missing.
   console.log(`Event submitted (best-effort): ${eventType} for run ${runId}`);
 }
+
+// ---------------------------------------------------------------------------
+// workflow cost — per-node token/cost breakdown for a completed workflow run
+// ---------------------------------------------------------------------------
+
+interface NodeCostEntry {
+  nodeId: string;
+  costUsd: number;
+  durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  modelUsage: Record<string, unknown> | null;
+}
+
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function formatCostDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const secs = Math.round(ms / 100) / 10;
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = Math.round(secs % 60);
+  return `${mins}m ${remSecs}s`;
+}
+
+function buildCostEntries(events: WorkflowEventRow[]): NodeCostEntry[] {
+  const entries: NodeCostEntry[] = [];
+  for (const event of events) {
+    if (event.event_type !== 'node_completed' || !event.step_name) continue;
+    const d = event.data;
+    const tokens = d.tokens as { input?: number; output?: number } | undefined;
+    entries.push({
+      nodeId: event.step_name,
+      costUsd: typeof d.cost_usd === 'number' ? d.cost_usd : 0,
+      durationMs: typeof d.duration_ms === 'number' ? d.duration_ms : 0,
+      inputTokens: tokens?.input ?? 0,
+      outputTokens: tokens?.output ?? 0,
+      modelUsage: (d.model_usage as Record<string, unknown>) ?? null,
+    });
+  }
+  return entries;
+}
+
+function costToMarkdown(run: WorkflowRun, entries: NodeCostEntry[]): string {
+  let totalCost = 0;
+  let totalIn = 0;
+  let totalOut = 0;
+  let totalDuration = 0;
+
+  const rows: string[] = [];
+  for (const e of entries) {
+    totalCost += e.costUsd;
+    totalIn += e.inputTokens;
+    totalOut += e.outputTokens;
+    totalDuration += e.durationMs;
+
+    const model = e.modelUsage ? (Object.keys(e.modelUsage)[0] ?? '') : '';
+    rows.push(
+      `| ${e.nodeId} | ${model} | ${formatTokenCount(e.inputTokens)} / ${formatTokenCount(e.outputTokens)} | $${e.costUsd.toFixed(4)} | ${formatCostDuration(e.durationMs)} |`
+    );
+  }
+
+  const lines = [
+    `## Cost Report — ${run.workflow_name}`,
+    '',
+    `**Run:** \`${run.id}\``,
+    `**Status:** ${run.status}`,
+    '',
+    '| Step | Model | Tokens (in/out) | Cost | Duration |',
+    '|------|-------|-----------------|------|----------|',
+    ...rows,
+    `| **Total** | | **${formatTokenCount(totalIn)} / ${formatTokenCount(totalOut)}** | **$${totalCost.toFixed(4)}** | **${formatCostDuration(totalDuration)}** |`,
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * Show per-node cost/token breakdown for a workflow run.
+ * Supports --last to use the most recent run, --format for output format.
+ */
+export async function workflowCostCommand(
+  runIdOrLast: string,
+  format: 'table' | 'markdown' | 'json' = 'table'
+): Promise<void> {
+  let runId = runIdOrLast;
+
+  if (runId === '--last') {
+    const runs = await workflowDb.listWorkflowRuns({ limit: 1 });
+    if (runs.length === 0) throw new Error('No workflow runs found.');
+    runId = runs[0].id;
+  }
+
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) throw new Error(`Workflow run not found: ${runId}`);
+
+  const events = await workflowEventsDb.listWorkflowEvents(runId);
+  const entries = buildCostEntries(events);
+
+  if (entries.length === 0) {
+    console.log(`No cost data available for run ${runId} (${run.workflow_name}).`);
+    console.log(
+      'Hint: cost data is only captured for AI-powered nodes (prompt/command), not bash nodes.'
+    );
+    return;
+  }
+
+  if (format === 'json') {
+    const totalCost = entries.reduce((s, e) => s + e.costUsd, 0);
+    const totalIn = entries.reduce((s, e) => s + e.inputTokens, 0);
+    const totalOut = entries.reduce((s, e) => s + e.outputTokens, 0);
+    console.log(
+      JSON.stringify(
+        {
+          run_id: run.id,
+          workflow_name: run.workflow_name,
+          status: run.status,
+          nodes: entries,
+          totals: { cost_usd: totalCost, input_tokens: totalIn, output_tokens: totalOut },
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (format === 'markdown') {
+    console.log(costToMarkdown(run, entries));
+    return;
+  }
+
+  // Default: table format
+  console.log(`\nWorkflow: ${run.workflow_name}`);
+  console.log(`Run:      ${run.id}`);
+  console.log(`Status:   ${run.status}\n`);
+
+  const col1 = Math.max(6, ...entries.map(e => e.nodeId.length)) + 2;
+  const header = `${'Step'.padEnd(col1)}${'Model'.padEnd(20)}${'Tokens (in/out)'.padEnd(20)}${'Cost'.padEnd(12)}Duration`;
+  console.log(header);
+  console.log('-'.repeat(header.length));
+
+  let totalCost = 0;
+  let totalIn = 0;
+  let totalOut = 0;
+  let totalDuration = 0;
+  for (const e of entries) {
+    totalCost += e.costUsd;
+    totalIn += e.inputTokens;
+    totalOut += e.outputTokens;
+    totalDuration += e.durationMs;
+    const model = e.modelUsage ? (Object.keys(e.modelUsage)[0] ?? '') : '';
+    const tokens = `${formatTokenCount(e.inputTokens)} / ${formatTokenCount(e.outputTokens)}`;
+    console.log(
+      `${e.nodeId.padEnd(col1)}${model.padEnd(20)}${tokens.padEnd(20)}$${e.costUsd.toFixed(4).padEnd(11)}${formatCostDuration(e.durationMs)}`
+    );
+  }
+  console.log('-'.repeat(header.length));
+  const totTokens = `${formatTokenCount(totalIn)} / ${formatTokenCount(totalOut)}`;
+  console.log(
+    `${'TOTAL'.padEnd(col1)}${''.padEnd(20)}${totTokens.padEnd(20)}$${totalCost.toFixed(4).padEnd(11)}${formatCostDuration(totalDuration)}`
+  );
+}
+
+/**
+ * Return markdown cost report for a run ID (used by entrypoint scripts).
+ * Returns empty string if no cost data available.
+ */
+export async function workflowCostMarkdown(runId: string): Promise<string> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) return '';
+  const events = await workflowEventsDb.listWorkflowEvents(runId);
+  const entries = buildCostEntries(events);
+  if (entries.length === 0) return '';
+  return costToMarkdown(run, entries);
+}
