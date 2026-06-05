@@ -784,6 +784,19 @@ async function* streamClaudeMessages(
         stop_reason?: string | null;
         num_turns?: number;
         errors?: string[];
+        // The Agent SDK's SDKResultMessage exposes the per-model token breakdown as
+        // `modelUsage` (camelCase). `model_usage` (snake_case) is kept as a defensive
+        // fallback for older/alternate result shapes — reading only snake_case dropped
+        // the model name everywhere downstream (workflow cost report Model column blank).
+        modelUsage?: Record<
+          string,
+          {
+            input_tokens: number;
+            output_tokens: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+          }
+        >;
         model_usage?: Record<
           string,
           {
@@ -794,6 +807,7 @@ async function* streamClaudeMessages(
           }
         >;
       };
+      const modelUsage = resultMsg.modelUsage ?? resultMsg.model_usage;
       const tokens = normalizeClaudeUsage(resultMsg.usage);
       const sdkErrors = Array.isArray(resultMsg.errors) ? resultMsg.errors : undefined;
       if (resultMsg.is_error) {
@@ -819,9 +833,7 @@ async function* streamClaudeMessages(
         ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
         ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
         ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),
-        ...(resultMsg.model_usage
-          ? { modelUsage: resultMsg.model_usage as Record<string, unknown> }
-          : {}),
+        ...(modelUsage ? { modelUsage: modelUsage as Record<string, unknown> } : {}),
       };
     }
   }
