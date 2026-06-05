@@ -218,6 +218,8 @@ describe('ClaudeProvider', () => {
     });
 
     test('yields result with cost, stopReason, numTurns, modelUsage when SDK provides them', async () => {
+      // The Agent SDK's SDKResultMessage exposes the per-model breakdown as
+      // `modelUsage` (camelCase) — see @anthropic-ai/claude-agent-sdk sdk.d.ts.
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'result',
@@ -225,7 +227,7 @@ describe('ClaudeProvider', () => {
           total_cost_usd: 0.0042,
           stop_reason: 'end_turn',
           num_turns: 3,
-          model_usage: {
+          modelUsage: {
             'claude-sonnet-4-6': {
               input_tokens: 100,
               output_tokens: 50,
@@ -254,6 +256,27 @@ describe('ClaudeProvider', () => {
             cache_read_input_tokens: 10,
           },
         },
+      });
+    });
+
+    test('falls back to snake_case model_usage when present (defensive)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          session_id: 'sid-legacy',
+          model_usage: {
+            'claude-opus-4-8': { input_tokens: 5, output_tokens: 7 },
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toMatchObject({
+        modelUsage: { 'claude-opus-4-8': { input_tokens: 5, output_tokens: 7 } },
       });
     });
 
