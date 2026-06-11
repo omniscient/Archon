@@ -74,6 +74,7 @@ import {
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  execBashScript,
 } from './executor-shared';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -1328,7 +1329,9 @@ async function executeBashNode(
   };
 
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
+    // Run via a temp script file, NOT inline `bash -c`: substituted $node.output
+    // refs can push the script past the kernel's per-argv limit → E2BIG at spawn.
+    const { stdout, stderr } = await execBashScript(finalScript, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -2131,7 +2134,9 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        // Stdin-fed script, not inline `-c` — see executeBashNode (E2BIG guard).
+        // Kept this branch's call semantics (no timeout/env additions from dev).
+        await execBashScript(substitutedBash, { cwd });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
