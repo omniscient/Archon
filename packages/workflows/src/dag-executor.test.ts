@@ -1437,6 +1437,53 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(errorMsg).toContain('diagnostic from stderr');
   });
 
+  it('bash node larger than the kernel argv limit still executes (E2BIG regression)', async () => {
+    // Substituted $node.output references can inflate a script far past the
+    // per-argument exec limit (128KiB MAX_ARG_STRLEN on Linux, ~32KB on Windows).
+    // Passing the script inline as `bash -c <script>` then fails with E2BIG at
+    // posix_spawn before a single line runs — the dark-factory push-and-pr loop.
+    // Executing via a temp script file has no such cap.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-e2big-run-id', {
+      workflow_name: 'bash-e2big',
+      conversation_id: 'conv-e2big',
+      user_message: 'test',
+    });
+
+    const oversizedComment = `# ${'x'.repeat(300_000)}\n`;
+    const bashNode: BashNode = {
+      id: 'big-script',
+      bash: `${oversizedComment}echo "BIG_SCRIPT_OK"`,
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-e2big',
+      testDir,
+      { name: 'bash-e2big', nodes: [bashNode] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'big-script'
+    );
+    expect(completedEvent).toBeDefined();
+    const nodeOutput = (completedEvent![0] as { data: { node_output: string } }).data.node_output;
+    expect(nodeOutput).toContain('BIG_SCRIPT_OK');
+  });
+
   it('variable substitution works in bash scripts', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -1511,7 +1558,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('passes config.envVars to bash subprocesses', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const execSpy = spyOn(git, 'execFileStdinAsync').mockResolvedValue({
+      stdout: 'ok\n',
+      stderr: '',
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-env-run-id');
@@ -1534,7 +1584,8 @@ describe('executeDagWorkflow -- bash nodes', () => {
 
     expect(execSpy).toHaveBeenCalledWith(
       'bash',
-      ['-c', 'echo ok'],
+      ['-s'],
+      'echo ok',
       expect.objectContaining({
         env: expect.objectContaining({ MY_SECRET: 'abc123' }),
       })
@@ -1591,7 +1642,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
   });
 
   it('passes user message through env vars, not string substitution, preventing shell injection', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const execSpy = spyOn(git, 'execFileStdinAsync').mockResolvedValue({
+      stdout: 'ok\n',
+      stderr: '',
+    });
     try {
       const mockDeps = createMockDeps();
       const platform = createMockPlatform();
@@ -1625,12 +1679,12 @@ describe('executeDagWorkflow -- bash nodes', () => {
       expect(execSpy).toHaveBeenCalledTimes(1);
       const firstCall = execSpy.mock.calls[0];
 
-      // The script passed to bash -c must contain literal $USER_MESSAGE (not substituted)
-      const bashArgs = firstCall?.[1] as string[];
-      expect(bashArgs[1]).toBe('echo $USER_MESSAGE');
+      // The script piped to bash -s must contain literal $USER_MESSAGE (not substituted)
+      expect(firstCall?.[1]).toEqual(['-s']);
+      expect(firstCall?.[2]).toBe('echo $USER_MESSAGE');
 
       // The env must contain the user message
-      const envArg = (firstCall?.[2] as { env: NodeJS.ProcessEnv }).env;
+      const envArg = (firstCall?.[3] as { env: NodeJS.ProcessEnv }).env;
       expect(envArg?.USER_MESSAGE).toBe('$(rm -rf /)');
       expect(envArg?.ARGUMENTS).toBe('$(rm -rf /)');
     } finally {

@@ -76,6 +76,7 @@ import {
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  execBashScript,
   safeSendMessage,
   type SendMessageContext,
 } from './executor-shared';
@@ -1358,7 +1359,9 @@ async function executeBashNode(
   };
 
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', finalScript], {
+    // Run via a temp script file, NOT inline `bash -c`: substituted $node.output
+    // refs can push the script past the kernel's per-argv limit → E2BIG at spawn.
+    const { stdout, stderr } = await execBashScript(finalScript, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -2181,7 +2184,8 @@ async function executeLoopNode(
           true, // escapedForBash
           logDir
         );
-        await execFileAsync('bash', ['-c', substitutedBash], {
+        // Temp script file, not inline `-c` — see executeBashNode (E2BIG guard).
+        await execBashScript(substitutedBash, {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           env: {

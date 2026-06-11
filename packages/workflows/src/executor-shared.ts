@@ -7,6 +7,7 @@
  */
 import { readFile } from 'fs/promises';
 import { join } from 'path';
+import { execFileStdinAsync } from '@archon/git';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
@@ -158,6 +159,32 @@ export function formatSubprocessFailure(
       stderrTail: stderrTail.length > 0 ? stderrTail : undefined,
     },
   };
+}
+
+/** Options accepted by {@link execBashScript} — mirrors the execFile options we use. */
+export interface ExecBashScriptOptions {
+  cwd?: string;
+  timeout?: number;
+  env?: NodeJS.ProcessEnv;
+  maxBuffer?: number;
+}
+
+/**
+ * Execute a bash script by piping it to `bash -s` over stdin, instead of
+ * passing it inline as `bash -c <script>`.
+ *
+ * Substituted `$node.output` references can inflate a script body arbitrarily —
+ * a single exec argument is capped at 128KiB on Linux (MAX_ARG_STRLEN) and ~32KB
+ * on Windows, so inline `-c` execution fails with E2BIG at posix_spawn before a
+ * single line of the script runs. Stdin has no size cap, and unlike a temp
+ * script file it needs no path translation for Windows bash flavors (WSL/MSYS2).
+ * Exit code, stdout, and stderr behave exactly as with `bash -c`.
+ */
+export async function execBashScript(
+  script: string,
+  options: ExecBashScriptOptions
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileStdinAsync('bash', ['-s'], script, options);
 }
 
 // ─── Credit/Limit Exhaustion Detection ──────────────────────────────────────
