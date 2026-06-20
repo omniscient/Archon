@@ -2034,7 +2034,7 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
     }
   });
 
-  it('skips node (does not run it) when when: expression is unparseable', async () => {
+  it('fails node (does not run it) when when: expression is unparseable', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('parse-err-skip-run');
@@ -2067,11 +2067,19 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
     );
 
     // Only the unconditional node should have triggered an AI call.
-    // The guarded node must be skipped (fail-closed), not executed.
+    // The guarded node must NOT be executed, but the run must be marked failed.
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+        (call[0] as Record<string, unknown>).step_name === 'guarded'
+    );
+    expect(nodeFailedEvents.length).toBe(1);
   });
 
-  it('sends a platform warning message naming the node and stating it was skipped', async () => {
+  it('sends an error message naming the node and stating the run failed', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('parse-err-warn-run');
@@ -2096,13 +2104,14 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
-    const warning = messages.find(m => m.includes('gate') && m.includes('skipped'));
+    const warning = messages.find(m => m.includes('gate') && m.includes('failed'));
     expect(warning).toBeDefined();
+    expect(warning).not.toMatch(/skipped/i);
     // Must NOT indicate the node ran (the old fail-open behavior)
     expect(warning).not.toMatch(/node ran/i);
   });
 
-  it('workflow completes without throwing when all nodes are skipped via parse error', async () => {
+  it('fails the workflow run (without throwing) when the only node has a parse error', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('parse-err-all-skip-run');
@@ -2126,6 +2135,15 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
         minimalConfig
       )
     ).resolves.toBeUndefined();
+    // executeDagWorkflow resolves normally; failure recorded in the store, not thrown.
+    expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+        (call[0] as Record<string, unknown>).step_name === 'only'
+    );
+    expect(nodeFailedEvents.length).toBe(1);
   });
 });
 
