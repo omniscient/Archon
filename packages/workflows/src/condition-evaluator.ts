@@ -14,7 +14,7 @@
  *                     AND has higher precedence than OR. No parentheses.
  *
  * Returns true = run this node, false = skip it.
- * Invalid/unparseable expressions default to false (fail-closed = skip the node).
+ * Invalid/unparseable expressions default to false (fail-closed = fail the node).
  */
 import type { NodeOutput } from './schemas';
 import { createLogger } from '@archon/paths';
