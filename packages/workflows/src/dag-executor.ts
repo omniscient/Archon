@@ -2766,45 +2766,45 @@ export async function executeDagWorkflow(
               nodeOutputs
             );
             if (!conditionParsed) {
-              const parseErrMsg = `\u26a0\ufe0f Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 node skipped (fail-closed). Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
+              const parseErrMsg = `\u274c Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 run failed \u2014 fix the expression and re-run. Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
               await safeSendMessage(platform, conversationId, parseErrMsg, {
                 workflowId: workflowRun.id,
                 nodeName: node.id,
               });
               getLog().error(
                 { nodeId: node.id, when: node.when },
-                'dag_node_skipped_condition_parse_error'
+                'dag_node_failed_condition_parse_error'
               );
-              await logNodeSkip(
-                logDir,
-                workflowRun.id,
-                node.id,
-                'when_condition_parse_error'
-              ).catch((err: Error) => {
-                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
-              });
+              await logNodeError(logDir, workflowRun.id, node.id, parseErrMsg).catch(
+                (err: Error) => {
+                  getLog().warn({ err, nodeId: node.id }, 'dag.node_error_log_write_failed');
+                }
+              );
               deps.store
                 .createWorkflowEvent({
                   workflow_run_id: workflowRun.id,
-                  event_type: 'node_skipped',
+                  event_type: 'node_failed',
                   step_name: node.id,
                   data: { reason: 'when_condition_parse_error', expr: node.when },
                 })
                 .catch((err: Error) => {
                   getLog().error(
-                    { err, workflowRunId: workflowRun.id, eventType: 'node_skipped' },
+                    { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
                     'workflow_event_persist_failed'
                   );
                 });
               const emitter = getWorkflowEventEmitter();
               emitter.emit({
-                type: 'node_skipped',
+                type: 'node_failed',
                 runId: workflowRun.id,
                 nodeId: node.id,
                 nodeName: node.command ?? node.id,
-                reason: 'when_condition_parse_error',
+                error: parseErrMsg,
               });
-              return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
+              return {
+                nodeId: node.id,
+                output: { state: 'failed' as const, output: '', error: parseErrMsg },
+              };
             }
             if (!conditionPasses) {
               getLog().info({ nodeId: node.id, when: node.when }, 'dag_node_skipped_condition');
