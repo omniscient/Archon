@@ -20,7 +20,7 @@ import type {
   PiProviderDefaults,
   ProviderDefaultsMap,
 } from '@archon/providers/types';
-import type { RawAliasesConfig } from '@archon/workflows/model-validation';
+import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
 
 export type {
   ClaudeProviderDefaults,
@@ -29,7 +29,7 @@ export type {
   PiProviderDefaults,
   ProviderDefaultsMap,
 };
-export type { RawAliasesConfig };
+export type { RawAliasesConfig, RawTiersConfig };
 
 /**
  * Intersection type: generic `ProviderDefaultsMap` (any string key) with
@@ -89,6 +89,12 @@ export interface GlobalConfig {
   aliases?: RawAliasesConfig;
 
   /**
+   * Cross-provider model tier presets accessible as small/medium/large in
+   * workflow/node `model:` fields.
+   */
+  tiers?: RawTiersConfig;
+
+  /**
    * Platform streaming preferences (can be overridden per conversation)
    */
   streaming?: {
@@ -144,6 +150,9 @@ export interface RepoConfig {
 
   /** Repo-level model aliases — override global aliases with same name. */
   aliases?: RawAliasesConfig;
+
+  /** Repo-level model tier presets — override global tiers with same name. */
+  tiers?: RawTiersConfig;
 
   /**
    * Commands configuration
@@ -234,6 +243,14 @@ export interface RepoConfig {
   env?: Record<string, string>;
 
   /**
+   * Repo-owner-curated list of recommended workflow names, in display order.
+   * Pinned on top of both the Workflows page and the sidebar run dropdown
+   * under a "Recommended for this project" header. Names not matching any
+   * discovered workflow are silently ignored (advisory).
+   */
+  recommendedWorkflows?: string[];
+
+  /**
    * Default commands/workflows configuration
    */
   defaults?: {
@@ -274,6 +291,11 @@ export interface MergedConfig {
    * Undefined when no aliases are configured anywhere.
    */
   aliases?: RawAliasesConfig;
+  /**
+   * Merged model tiers (repo > global). Used by buildAiProfile at execution time.
+   * Undefined when no tiers are configured anywhere.
+   */
+  tiers?: RawTiersConfig;
   streaming: {
     telegram: 'stream' | 'batch';
     discord: 'stream' | 'batch';
@@ -340,4 +362,14 @@ export interface SafeConfig {
     loadDefaultCommands: boolean;
     loadDefaultWorkflows: boolean;
   };
+  /** Configured small/medium/large tier presets (merged repo > global). */
+  tiers?: RawTiersConfig;
+  /**
+   * Built-in tier presets for the current default provider (from
+   * tier-defaults.json via buildAiProfile). Lets the editor show what an
+   * unset tier resolves to without the web bundle importing @archon/workflows.
+   */
+  tierDefaults?: RawTiersConfig;
+  /** Configured @custom model aliases (merged repo > global). Not secrets. */
+  aliases?: RawAliasesConfig;
 }

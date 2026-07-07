@@ -7,6 +7,7 @@ export {
   ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
   getArchonConfigPath,
+  getCredentialKeyPath,
   getArchonEnvPath,
   getRepoArchonEnvPath,
   getHomeWorkflowsPath,
@@ -54,10 +55,18 @@ export {
 } from './update-check';
 export type { UpdateCheckResult } from './update-check';
 
+// Tier notice (one-time CLI notice for unconfigured tier-keyword workflows)
+export { readTierNoticeState, markTierNoticeShown } from './tier-notice';
+export type { TierNoticeState } from './tier-notice';
+
 // Anonymous telemetry
 export {
   captureWorkflowInvoked,
   captureArchonStarted,
+  captureArchonActive,
+  captureChatTurn,
+  captureApprovalResolved,
+  captureCodebaseRegistered,
   captureWorkflowCompleted,
   classifyWorkflowForTelemetry,
   TELEMETRY_SCHEMA_VERSION,
@@ -69,8 +78,12 @@ export {
 export type {
   WorkflowInvokedProperties,
   ArchonStartedProperties,
+  ChatTurnProperties,
+  DeploymentShapeProperties,
   WorkflowCompletedProperties,
   WorkflowExitReason,
+  WorkflowErrorClass,
+  WorkflowNodeType,
   WorkflowTelemetrySource,
   TelemetryStatus,
   TelemetryDisabledReason,

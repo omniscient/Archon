@@ -55,7 +55,12 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
 export interface ProviderInfo {
   id: string;
   displayName: string;
-  capabilities: Record<string, boolean>;
+  // Derived from the OpenAPI spec so the string-union `structuredOutput`
+  // ('enforced' | 'best-effort' | false) is typed honestly rather than widened
+  // to boolean. `Partial` because SettingsPage synthesizes placeholder entries
+  // for config-only providers with unknown capabilities ({}); the web never
+  // reads individual capability fields, only the API populates the full shape.
+  capabilities: Partial<components['schemas']['ProviderCapabilities']>;
   builtIn: boolean;
 }
 
@@ -222,10 +227,19 @@ export type WorkflowEventResponse = components['schemas']['WorkflowEvent'];
 
 export type WorkflowListEntry = components['schemas']['WorkflowListEntry'];
 
-export async function listWorkflows(cwd?: string): Promise<WorkflowListEntry[]> {
+export interface WorkflowListResult {
+  workflows: WorkflowListEntry[];
+  /** Repo-owner-curated names from `.archon/config.yaml`, declared order. */
+  recommended: string[];
+}
+
+export async function listWorkflows(cwd?: string): Promise<WorkflowListResult> {
   const params = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
-  const result = await fetchJSON<{ workflows: WorkflowListEntry[] }>(`/api/workflows${params}`);
-  return result.workflows;
+  const result = await fetchJSON<{
+    workflows: WorkflowListEntry[];
+    recommended: string[];
+  }>(`/api/workflows${params}`);
+  return { workflows: result.workflows, recommended: result.recommended ?? [] };
 }
 
 export async function runWorkflow(

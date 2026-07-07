@@ -4,10 +4,9 @@
  * Both CLI and command-handler are thin formatting adapters over these functions.
  * Operations throw on errors; callers catch and format for their platform.
  */
-import { createLogger } from '@archon/paths';
+import { createLogger, captureApprovalResolved } from '@archon/paths';
 import {
   RESUMABLE_WORKFLOW_STATUSES,
-  TERMINAL_WORKFLOW_STATUSES,
   isApprovalContext,
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, ApprovalContext } from '@archon/workflows/schemas/workflow-run';
@@ -102,12 +101,19 @@ export async function resumeWorkflow(runId: string): Promise<WorkflowRun> {
 }
 
 /**
- * Abandon a non-terminal workflow run (marks it as cancelled).
+ * Abandon a workflow run (marks it as cancelled).
+ *
+ * Running, paused, AND failed runs can be abandoned. A `failed` run is terminal
+ * per TERMINAL_WORKFLOW_STATUSES but remains resumable, so the user must be able
+ * to discard it — hence the inline check here intentionally diverges from that
+ * constant and blocks only the two non-resumable terminal states.
  */
 export async function abandonWorkflow(runId: string): Promise<WorkflowRun> {
   const run = await getRunOrThrow(runId, 'operations.workflow_abandon_lookup_failed');
-  if (TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
-    throw new Error(`Cannot abandon run with status '${run.status}'. Run is already terminal.`);
+  if (run.status === 'completed' || run.status === 'cancelled') {
+    throw new Error(
+      `Cannot abandon run with status '${run.status}'. Only running, paused, or failed runs can be abandoned.`
+    );
   }
   try {
     await workflowDb.cancelWorkflowRun(runId);
@@ -161,6 +167,8 @@ export async function approveWorkflow(
         step_name: approval.nodeId,
         data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
       });
+      // Anonymous telemetry: binary resolution only — no ids/comments/names.
+      captureApprovalResolved({ resolution: 'approved' });
       // Transition to 'failed' so findResumableRun picks it up.
       // IMPORTANT: metadata is MERGED (not replaced) — the approval context must survive
       // intact so the resumed executor can detect the correct startIteration.
@@ -192,6 +200,8 @@ export async function approveWorkflow(
       step_name: approval.nodeId,
       data: { decision: 'approved', comment: approvalComment },
     });
+    // Anonymous telemetry: binary resolution only — no ids/comments/names.
+    captureApprovalResolved({ resolution: 'approved' });
     // Transition to 'failed' so findResumableRun picks it up. Clear any rejection state.
     await workflowDb.updateWorkflowRun(runId, {
       status: 'failed',
@@ -246,6 +256,8 @@ export async function rejectWorkflow(
       step_name: approval?.nodeId ?? 'unknown',
       data: { decision: 'rejected', reason: rejectReason },
     });
+    // Anonymous telemetry: binary resolution only — no ids/reasons/names.
+    captureApprovalResolved({ resolution: 'rejected' });
 
     if (approval?.onRejectPrompt !== undefined) {
       if (currentCount + 1 >= maxAttempts) {

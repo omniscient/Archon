@@ -807,15 +807,15 @@ export class WorktreeProvider implements IIsolationProvider {
         { repoPath, branch: configuredBaseBranch ?? 'auto-detect' },
         'workspace_sync_starting'
       );
-      // Only hard-reset for Archon-managed clones (under ~/.archon/workspaces/).
-      // Locally-registered repos get fetch-only to avoid destroying uncommitted work.
+      // Only hard-reset for Archon-managed clones when creating isolated worktrees.
+      // Locally-registered repos keep the non-destructive fast-forward mode.
       const isManagedClone = repoPath
         .replace(/\\/g, '/')
         .startsWith(getArchonWorkspacesPath().replace(/\\/g, '/'));
       const { branch } = await syncWorkspace(
         repoPath,
         configuredBaseBranch ? toBranchName(configuredBaseBranch) : undefined,
-        { resetAfterFetch: isManagedClone }
+        { mode: isManagedClone ? 'reset' : 'fast-forward' }
       );
       getLog().debug({ repoPath, branch }, 'workspace_synced');
       return branch;
@@ -1089,10 +1089,21 @@ export class WorktreeProvider implements IIsolationProvider {
         : `origin/${baseBranch}`;
 
     try {
-      // Try to create with new branch
+      // `--no-track` keeps `branch.<name>.merge` unset; otherwise `gh pr view`
+      // (no PR number) resolves to the base branch's PR via upstream config.
       await execFileAsync(
         'git',
-        ['-C', repoPath, 'worktree', 'add', worktreePath, '-b', branchName, startPoint],
+        [
+          '-C',
+          repoPath,
+          'worktree',
+          'add',
+          '--no-track',
+          worktreePath,
+          '-b',
+          branchName,
+          startPoint,
+        ],
         {
           timeout: GIT_OPERATION_TIMEOUT_MS,
         }

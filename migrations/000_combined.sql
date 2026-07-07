@@ -2,7 +2,7 @@
 -- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
--- 12 Tables:
+-- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
 --   1c. remote_agent_users
@@ -15,6 +15,8 @@
 --   6b. remote_agent_workflow_node_sessions
 --   7. remote_agent_messages
 --   8. remote_agent_user_github_tokens
+--   9. remote_agent_user_provider_keys
+--   10. remote_agent_user_ai_prefs
 --
 -- Dropped tables (via migrations):
 --   - remote_agent_command_templates (017)
@@ -33,6 +35,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
   name VARCHAR(255) NOT NULL,
   repository_url VARCHAR(500),
   default_cwd VARCHAR(500) NOT NULL,
+  default_branch VARCHAR(255),
   ai_assistant_type VARCHAR(20) DEFAULT 'claude',
   allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
   commands JSONB DEFAULT '{}'::jsonb,
@@ -41,7 +44,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
 );
 
 COMMENT ON TABLE remote_agent_codebases IS
-  'Repository metadata: name, URL, working directory, AI assistant type, and command paths (JSONB)';
+  'Repository metadata: name, URL, working directory, default branch, AI assistant type, and command paths (JSONB)';
 
 -- ============================================================================
 -- Table 1b: Codebase Env Vars
@@ -380,6 +383,10 @@ ALTER TABLE remote_agent_sessions
 ALTER TABLE remote_agent_codebases
   ADD COLUMN IF NOT EXISTS allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- From migration 023: detected default branch on codebases
+ALTER TABLE remote_agent_codebases
+  ADD COLUMN IF NOT EXISTS default_branch VARCHAR(255);
+
 -- User identity foreign keys (nullable on the four primary tables).
 -- All FKs use ON DELETE SET NULL so future user deletion never cascades destructively.
 ALTER TABLE remote_agent_conversations
@@ -412,6 +419,64 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_github_tokens (
   refresh_token_encrypted TEXT,
   access_token_expires_at TIMESTAMP WITH TIME ZONE,
   refresh_token_expires_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id)
+);
+
+-- Phase 2: per-user AI-provider credentials (BYO API key + subscription login),
+-- encrypted at rest with the existing token-crypto key. One row per
+-- (user_id, provider); cascades on user deletion. Exactly one of
+-- api_key_encrypted / oauth_creds_encrypted is populated per row; `kind`
+-- records which. Gated on TOKEN_ENCRYPTION_KEY at the application layer.
+CREATE TABLE IF NOT EXISTS remote_agent_user_provider_keys (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  provider VARCHAR(64) NOT NULL,
+  kind VARCHAR(16) NOT NULL,
+  api_key_encrypted TEXT,
+  oauth_creds_encrypted TEXT,
+  label VARCHAR(255),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id, provider)
+);
+
+-- #1955: credential rows are vendor-keyed (claude→anthropic, codex→openai,
+-- copilot→github-copilot) so one credential can serve every agent that
+-- consumes the vendor. Idempotent data fix: where both a legacy and a vendor
+-- row exist for the same user, the vendor row wins (rare — requires having
+-- connected both ids pre-rename); then legacy rows are renamed in place.
+-- Tested on SQLite (adapters/sqlite.test.ts covers rename, conflict, and
+-- idempotency); the Postgres DML below is the same statements but is NOT
+-- covered by an automated test — verified manually on the multi-user smoke.
+-- Survivable either way: reads normalize legacy ids (normalizeCredentialVendor).
+DELETE FROM remote_agent_user_provider_keys
+WHERE provider IN ('claude', 'codex', 'copilot')
+  AND EXISTS (
+    SELECT 1 FROM remote_agent_user_provider_keys v
+    WHERE v.user_id = remote_agent_user_provider_keys.user_id
+      AND v.provider = CASE remote_agent_user_provider_keys.provider
+        WHEN 'claude' THEN 'anthropic'
+        WHEN 'codex' THEN 'openai'
+        WHEN 'copilot' THEN 'github-copilot'
+      END
+  );
+UPDATE remote_agent_user_provider_keys SET provider = 'anthropic' WHERE provider = 'claude';
+UPDATE remote_agent_user_provider_keys SET provider = 'openai' WHERE provider = 'codex';
+UPDATE remote_agent_user_provider_keys SET provider = 'github-copilot' WHERE provider = 'copilot';
+
+-- Phase 3: per-user AI preferences (model tiers, @custom aliases, default
+-- assistant). NON-encrypted — model names are not secrets (mirrors
+-- codebase_env_vars, not the provider-key store). One row per user; cascades
+-- on user deletion. `tiers` / `aliases` are JSON-as-TEXT (parsed in the
+-- store layer so SQLite and Postgres behave identically).
+CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES remote_agent_users(id) ON DELETE CASCADE,
+  tiers TEXT,
+  aliases TEXT,
+  default_provider VARCHAR(64),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(user_id)

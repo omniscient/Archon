@@ -20,9 +20,6 @@ import { parseArgs } from 'util';
 import { resolve } from 'path';
 import { existsSync } from 'fs';
 
-// CLAUDECODE=1 warning is emitted inside stripCwdEnv() (boot import above)
-// BEFORE the marker is deleted from process.env. No duplicate warning here.
-
 // Smart defaults for Claude auth
 // If no explicit tokens, default to global auth from `claude /login`
 if (!process.env.CLAUDE_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
@@ -72,6 +69,19 @@ import { validateWorkflowsCommand, validateCommandsCommand } from './commands/va
 import { serveCommand } from './commands/serve';
 import { doctorCommand } from './commands/doctor';
 import { authGithubCommand } from './commands/auth';
+import {
+  aiKeySetCommand,
+  aiListCommand,
+  aiLogoutCommand,
+  aiLoginCommand,
+  aiTierSetCommand,
+  aiTierListCommand,
+  aiTierUnsetCommand,
+  aiAliasSetCommand,
+  aiAliasListCommand,
+  aiAliasUnsetCommand,
+  aiDefaultCommand,
+} from './commands/ai';
 import { telemetryStatusCommand, telemetryResetCommand } from './commands/telemetry';
 import { closeDatabase } from '@archon/core';
 import {
@@ -122,6 +132,17 @@ Commands:
   skill install [path]       Install the bundled Archon skill into .claude/skills/archon
   doctor                     Verify your Archon setup (Claude binary, gh auth, DB, adapters)
   auth github                Connect your GitHub identity via device flow (multi-user installs)
+  ai key set <provider>      Connect an AI provider API key (multi-user installs; key read from prompt/stdin)
+  ai login <provider>        Connect a subscription (claude/copilot) via OAuth — codex is API-key only
+  ai list                    List your connected AI provider keys
+  ai logout <provider>       Disconnect an AI provider key
+  ai tier set <t> <p> <m>    Set a model tier (small/medium/large) → provider/model [--effort <e>] [--scope user|install]
+  ai tier list [--json]      Show configured tiers (install + yours) vs built-in defaults
+  ai tier unset <tier>       Reset a tier to its built-in default [--scope user|install]
+  ai alias set <@n> <p> <m>  Set a @custom model alias [--effort <e>] [--scope user|install]
+  ai alias list [--json]     Show configured @custom aliases (install + yours)
+  ai alias unset <@name>     Remove a @custom alias [--scope user|install]
+  ai default <provider>      Set the default assistant [--scope user|install]
   telemetry status           Show anonymous telemetry state (enabled, reason, ID, host)
   telemetry reset            Rotate the anonymous install UUID
   validate workflows [name]  Validate workflow definitions and their references
@@ -277,6 +298,7 @@ async function main(): Promise<number> {
         all: { type: 'boolean' },
         status: { type: 'string' },
         limit: { type: 'string' },
+        effort: { type: 'string' },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -323,6 +345,7 @@ async function main(): Promise<number> {
     'doctor',
     'telemetry',
     'auth',
+    'ai',
   ];
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
@@ -780,6 +803,83 @@ async function main(): Promise<number> {
               console.error(`Unknown auth subcommand: ${subcommand}`);
             }
             console.error('Available: github');
+            return 1;
+        }
+      }
+
+      case 'ai': {
+        switch (subcommand) {
+          case 'key': {
+            const action = positionals[2];
+            if (action !== 'set') {
+              console.error('Usage: archon ai key set <provider>');
+              return 1;
+            }
+            return await aiKeySetCommand(positionals[3]);
+          }
+          case 'list':
+            return await aiListCommand();
+          case 'logout':
+            return await aiLogoutCommand(positionals[2]);
+          case 'login':
+            return await aiLoginCommand(positionals[2]);
+          case 'tier': {
+            const action = positionals[2];
+            const scopeFlag = values.scope as string | undefined;
+            switch (action) {
+              case 'set':
+                return await aiTierSetCommand(
+                  positionals[3],
+                  positionals[4],
+                  positionals[5],
+                  values.effort as string | undefined,
+                  scopeFlag
+                );
+              case 'list':
+                return await aiTierListCommand(jsonFlag);
+              case 'unset':
+                return await aiTierUnsetCommand(positionals[3], scopeFlag);
+              default:
+                console.error(
+                  'Usage: archon ai tier set <small|medium|large> <provider> <model> [--effort <e>] [--scope user|install] | tier list [--json] | tier unset <tier> [--scope user|install]'
+                );
+                return 1;
+            }
+          }
+          case 'alias': {
+            const action = positionals[2];
+            const scopeFlag = values.scope as string | undefined;
+            switch (action) {
+              case 'set':
+                return await aiAliasSetCommand(
+                  positionals[3],
+                  positionals[4],
+                  positionals[5],
+                  values.effort as string | undefined,
+                  scopeFlag
+                );
+              case 'list':
+                return await aiAliasListCommand(jsonFlag);
+              case 'unset':
+                return await aiAliasUnsetCommand(positionals[3], scopeFlag);
+              default:
+                console.error(
+                  'Usage: archon ai alias set <@name> <provider> <model> [--effort <e>] [--scope user|install] | alias list [--json] | alias unset <@name> [--scope user|install]'
+                );
+                return 1;
+            }
+          }
+          case 'default':
+            return await aiDefaultCommand(positionals[2], values.scope as string | undefined);
+          default:
+            if (subcommand === undefined) {
+              console.error('Missing ai subcommand');
+            } else {
+              console.error(`Unknown ai subcommand: ${subcommand}`);
+            }
+            console.error(
+              'Available: key set <provider>, login <provider>, list, logout <provider>, tier set|list|unset, alias set|list|unset, default <provider>'
+            );
             return 1;
         }
       }
