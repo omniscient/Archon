@@ -83,10 +83,17 @@ describe('ClaudeProvider', () => {
   describe('constructor', () => {
     test('throws when running as root (UID 0)', () => {
       const spy = spyOn(claudeModule, 'getProcessUid').mockReturnValue(0);
-      expect(() => new ClaudeProvider()).toThrow(
-        'does not support bypassPermissions when running as root'
-      );
-      spy.mockRestore();
+      // IS_SANDBOX=1 bypasses the root check; clear it so the guard can trigger
+      const savedSandbox = process.env.IS_SANDBOX;
+      delete process.env.IS_SANDBOX;
+      try {
+        expect(() => new ClaudeProvider()).toThrow(
+          'does not support bypassPermissions when running as root'
+        );
+      } finally {
+        if (savedSandbox !== undefined) process.env.IS_SANDBOX = savedSandbox;
+        spy.mockRestore();
+      }
     });
 
     test('does not throw for non-root user', () => {
@@ -118,13 +125,14 @@ describe('ClaudeProvider', () => {
         skills: true,
         agents: true,
         toolRestrictions: true,
-        structuredOutput: true,
+        structuredOutput: 'enforced',
         envInjection: true,
         costControl: true,
         effortControl: true,
         thinkingControl: true,
         fallbackModel: true,
         sandbox: true,
+        nativeTools: true,
       });
     });
   });
@@ -463,6 +471,326 @@ describe('ClaudeProvider', () => {
       });
     });
 
+    test('result chunk carries resumed:true when resumeSessionId provided (resume-or-error)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'resumed-sid' };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('prompt', '/workspace', 'session-to-resume')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.find(c => c.type === 'result')).toMatchObject({ resumed: true });
+    });
+
+    test('result chunk omits resumed when no resumeSessionId', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'fresh-sid' };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('prompt', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      const result = chunks.find(c => c.type === 'result');
+      expect(result).toBeDefined();
+      // Contract is "omitted when no resume was requested", not "present-but-undefined".
+      expect(result).not.toHaveProperty('resumed');
+    });
+
+    // --- Phase 1 of #975 — SDK task/hook lifecycle event handling -----
+
+    test('yields task_started chunk from SDK system message', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          task_id: 't-1',
+          description: 'Investigating the bug',
+          task_type: 'general-purpose',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({
+        type: 'task_started',
+        taskId: 't-1',
+        description: 'Investigating the bug',
+        taskType: 'general-purpose',
+      });
+    });
+
+    test('drops housekeeping task_started when SDK sets skip_transcript', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          task_id: 't-housekeeping',
+          description: 'Ambient task',
+          skip_transcript: true,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(0);
+    });
+
+    test('yields task_progress with summary + usage + lastToolName', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_progress',
+          task_id: 't-1',
+          description: 'Working on auth',
+          summary: 'Reading auth module',
+          usage: { total_tokens: 1234, tool_uses: 3, duration_ms: 28000 },
+          last_tool_name: 'Read',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'task_progress',
+          taskId: 't-1',
+          description: 'Working on auth',
+          summary: 'Reading auth module',
+          usage: { total_tokens: 1234, tool_uses: 3, duration_ms: 28000 },
+          lastToolName: 'Read',
+        },
+      ]);
+    });
+
+    test('yields task_notification with completed status', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-1',
+          status: 'completed',
+          output_file: '/tmp/task-output.json',
+          summary: 'Plan ready',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'task_notification',
+          taskId: 't-1',
+          status: 'completed',
+          summary: 'Plan ready',
+          outputFile: '/tmp/task-output.json',
+        },
+      ]);
+    });
+
+    test('yields task_notification with failed status', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-2',
+          status: 'failed',
+          output_file: '/tmp/task-2.json',
+          summary: 'Task failed',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toMatchObject({ type: 'task_notification', status: 'failed' });
+    });
+
+    test('yields hook_started chunk from SDK system message', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_started',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_started',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+        },
+      ]);
+    });
+
+    test('yields hook_response chunk with outcome and exit code', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          outcome: 'success',
+          exit_code: 0,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_response',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+          outcome: 'success',
+          exitCode: 0,
+        },
+      ]);
+    });
+
+    test('yields hook_response with error outcome and no exit_code', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-2',
+          hook_name: 'Edit',
+          hook_event: 'PreToolUse',
+          outcome: 'error',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toEqual({
+        type: 'hook_response',
+        hookId: 'h-2',
+        hookName: 'Edit',
+        hookEvent: 'PreToolUse',
+        outcome: 'error',
+      });
+      expect(chunks[0]).not.toHaveProperty('exitCode');
+    });
+
+    test('emits complete task lifecycle in correct order', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          task_id: 't-1',
+          description: 'Working on the bug',
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_progress',
+          task_id: 't-1',
+          description: 'Working on the bug',
+          summary: 'Reading stack trace',
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-1',
+          status: 'completed',
+          output_file: '/tmp/t-1.json',
+          summary: 'Done',
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.map(c => c.type)).toEqual([
+        'task_started',
+        'task_progress',
+        'task_notification',
+      ]);
+    });
+
+    // --- Phase 4 of #975 — agentProgressSummaries enabled for workflow nodes -----
+
+    test('enables agentProgressSummaries by default for workflow nodes', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: { nodeId: 'plan' },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options).toMatchObject({ agentProgressSummaries: true });
+    });
+
+    test('respects explicit agentProgressSummaries: false override', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: { nodeId: 'plan', agentProgressSummaries: false },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options).toMatchObject({ agentProgressSummaries: false });
+    });
+
+    test('does not set agentProgressSummaries for direct chat (no nodeConfig)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      // Phase 4 opt-in is for workflow nodes only. Direct chat keeps the
+      // SDK default (false) so the chat surface is unchanged.
+      expect(callArgs.options).not.toHaveProperty('agentProgressSummaries');
+    });
+
     test('handles tool_use with empty input', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -749,12 +1077,32 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options.settingSources).toEqual(['project', 'user']);
     });
 
-    test('defaults settingSources to project when not provided', async () => {
+    test('defaults settingSources to project + user when not provided', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'test-session' };
       });
 
       for await (const _ of client.sendQuery('test', '/tmp')) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project', 'user']);
+    });
+
+    test("honors explicit settingSources: ['project'] to opt out of user scope", async () => {
+      // Locks in the contract: setting settingSources: ['project'] in
+      // .archon/config.yaml must NOT be silently widened to the new default.
+      // A future refactor that drops the `?? ['project', 'user']` guard would
+      // expand skill/command/agent scope for every project-only deployment.
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        assistantConfig: { settingSources: ['project'] },
+      })) {
         // consume
       }
 
@@ -1242,6 +1590,44 @@ describe('sendQuery decomposition behaviors', () => {
     );
   });
 
+  test('treats is_error: true + subtype: success as clean success (stop_sequence)', async () => {
+    // Claude Agent SDK's SDKResultSuccess explicitly types is_error as boolean
+    // (not literal false). When a model is configured with stop sequences (e.g.
+    // via output_format / json_schema enforcement) the SDK reports is_error:
+    // true alongside subtype: 'success' and stop_reason: 'stop_sequence' — its
+    // way of signalling "non-default termination, but not a failure".
+    // Regression test for #1425.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        session_id: 'sid-stop-seq',
+        is_error: true,
+        subtype: 'success',
+        stop_reason: 'stop_sequence',
+      };
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test', '/workspace')) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject({
+      type: 'result',
+      sessionId: 'sid-stop-seq',
+      stopReason: 'stop_sequence',
+    });
+    expect(chunks[0]).not.toHaveProperty('isError');
+    expect(chunks[0]).not.toHaveProperty('errorSubtype');
+    expect(chunks[0]).not.toHaveProperty('errors');
+    expect(mockLogger.error).not.toHaveBeenCalledWith(expect.anything(), 'claude.result_is_error');
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'sid-stop-seq', stopReason: 'stop_sequence' }),
+      'claude.result_success_validated'
+    );
+  });
+
   describe('inline agents (nodeConfig.agents)', () => {
     test('passes inline agents map through to SDK options.agents', async () => {
       mockQuery.mockImplementation(async function* () {
@@ -1341,6 +1727,52 @@ describe('sendQuery decomposition behaviors', () => {
         expect.objectContaining({ nodeSkills: ['my-skill'] }),
         'claude.inline_agents_override_skills_wrapper'
       );
+    });
+
+    test('skills without allowed_tools omits tools field so SDK defaults apply', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: {
+          skills: ['agent-browser'],
+          // no allowed_tools → options.tools is undefined
+        },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const outAgents = callArgs.options.agents as Record<
+        string,
+        { description: string; tools?: string[] }
+      >;
+      // tools should NOT be set — lets SDK provide all default native tools
+      expect(outAgents['dag-node-skills'].tools).toBeUndefined();
+    });
+
+    test('skills with allowed_tools includes Skill in the tools list', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: {
+          skills: ['agent-browser'],
+          allowed_tools: ['Bash', 'Read'],
+        },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const outAgents = callArgs.options.agents as Record<
+        string,
+        { description: string; tools?: string[] }
+      >;
+      // tools should include the explicit list plus Skill
+      expect(outAgents['dag-node-skills'].tools).toEqual(['Bash', 'Read', 'Skill']);
     });
 
     test('does NOT warn when inline agents do not collide with the skills wrapper', async () => {

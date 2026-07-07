@@ -19,11 +19,17 @@ const mockLogger = {
   isLevelEnabled: mock(() => true),
   level: 'info',
 };
+// Telemetry is fire-and-forget; mock as no-ops so the executor can call them.
+// Hoisted so tests can assert on the completion call (outcome / exit reason).
+const mockCaptureWorkflowInvoked = mock(() => {});
+const mockCaptureWorkflowCompleted = mock(() => {});
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   parseOwnerRepo: mock(() => null),
   getRunArtifactsPath: mock(() => '/tmp/artifacts'),
   getProjectLogsPath: mock(() => '/tmp/logs'),
+  captureWorkflowInvoked: mockCaptureWorkflowInvoked,
+  captureWorkflowCompleted: mockCaptureWorkflowCompleted,
 }));
 
 // --- Mock git ---
@@ -60,7 +66,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 // --- Import after mocks ---
-import { executeWorkflow } from './executor';
+import { executeWorkflow, hydrateResumableRun } from './executor';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -75,6 +81,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
+    getWorkflowRunStatus: mock(async () => 'completed' as const),
     createWorkflowEvent: mock(async () => {}),
     findResumableRun: mock(async () => null),
     getCompletedDagNodeOutputs: mock(async () => new Map()),
@@ -370,82 +377,9 @@ describe('executeWorkflow', () => {
   // Resume orphan cleanup
   // -------------------------------------------------------------------------
 
-  describe('resume orphan cleanup', () => {
-    it('cancels orphaned pre-created row when resume activates', async () => {
-      // Orchestrator dispatched and pre-created this row before resume
-      // detection ran. Once resume takes over (using resumableRun instead),
-      // the pre-created row is a stale lock-token that would block the
-      // user's next back-to-back resume.
-      const preCreated = makeRun({ id: 'pre-created-orphan', status: 'pending' });
-      const resumable = makeRun({ id: 'failed-prior-run', status: 'failed' });
-      const updateSpy = mock(async () => {});
-      const store = makeStore({
-        findResumableRun: mock(async () => resumable),
-        getCompletedDagNodeOutputs: mock(async () => new Map([['node1', 'output1']])),
-        resumeWorkflowRun: mock(async () => makeRun({ id: 'failed-prior-run', status: 'running' })),
-        updateWorkflowRun: updateSpy,
-      });
-      const deps = makeDeps(store);
-
-      await executeWorkflow(
-        deps,
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow(),
-        'test message',
-        'db-conv-1',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        preCreated
-      );
-
-      // Find the orphan-cancellation call (there may be other updateWorkflowRun
-      // calls during normal execution flow, e.g., status transitions).
-      const orphanCancelCall = updateSpy.mock.calls.find(
-        (call: unknown[]) =>
-          call[0] === 'pre-created-orphan' &&
-          (call[1] as { status?: string })?.status === 'cancelled'
-      );
-      expect(orphanCancelCall).toBeDefined();
-    });
-
-    it('proceeds with resume even if orphan cancellation fails (best-effort)', async () => {
-      const preCreated = makeRun({ id: 'pre-created-orphan', status: 'pending' });
-      const resumable = makeRun({ id: 'failed-prior-run', status: 'failed' });
-      const updateSpy = mock(async (id: string) => {
-        if (id === 'pre-created-orphan') throw new Error('DB busy');
-      });
-      const store = makeStore({
-        findResumableRun: mock(async () => resumable),
-        getCompletedDagNodeOutputs: mock(async () => new Map([['node1', 'output1']])),
-        resumeWorkflowRun: mock(async () => makeRun({ id: 'failed-prior-run', status: 'running' })),
-        updateWorkflowRun: updateSpy,
-      });
-      const deps = makeDeps(store);
-
-      const result = await executeWorkflow(
-        deps,
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow(),
-        'test message',
-        'db-conv-1',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        preCreated
-      );
-
-      // Resume must still complete — the 5-min stale-pending window is the
-      // safety net for cleanup failures here.
-      expect(result.workflowRunId).toBe('failed-prior-run');
-    });
-  });
+  // Resume-pipeline coverage lives in the "hydrateResumableRun" suite at the
+  // bottom of this file (executor no longer queries findResumableRun on its
+  // own, so there is no orphan to clean up).
 
   // -------------------------------------------------------------------------
   // Model/provider resolution
@@ -581,12 +515,14 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('resume logic', () => {
-    it('starts fresh run when findResumableRun returns null', async () => {
-      const store = makeStore({
-        findResumableRun: mock(async () => null),
-      });
+    it('does NOT call findResumableRun on its own', async () => {
+      // Two back-to-back executions of the same workflow at the same cwd
+      // must not cross-leak. Resume detection lives at the caller; the
+      // executor must never touch findResumableRun on its own.
+      const findSpy = mock(async () => makeRun({ id: 'stale-prior', status: 'failed' }));
+      const store = makeStore({ findResumableRun: findSpy });
       const deps = makeDeps(store);
-      const result = await executeWorkflow(
+      await executeWorkflow(
         deps,
         makePlatform(),
         'conv-1',
@@ -595,74 +531,39 @@ describe('executeWorkflow', () => {
         'test message',
         'db-conv-1'
       );
-      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
-      expect(result.workflowRunId).toBe('run-123');
-    });
-
-    it('starts fresh run when findResumableRun throws', async () => {
-      const store = makeStore({
-        findResumableRun: mock(async () => {
-          throw new Error('DB error');
-        }),
-      });
-      const deps = makeDeps(store);
-      const result = await executeWorkflow(
-        deps,
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow(),
-        'test message',
-        'db-conv-1'
-      );
-      // Should fall back to creating a fresh run
-      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
-      expect(result.workflowRunId).toBe('run-123');
-    });
-
-    it('starts fresh run when prior run has 0 completed nodes', async () => {
-      const failedRun = makeRun({ id: 'prior-run', status: 'failed' });
-      const store = makeStore({
-        findResumableRun: mock(async () => failedRun),
-        getCompletedDagNodeOutputs: mock(async () => new Map()),
-      });
-      const deps = makeDeps(store);
-      const result = await executeWorkflow(
-        deps,
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow(),
-        'test message',
-        'db-conv-1'
-      );
-      // Should skip resume and create a fresh run
-      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(findSpy).not.toHaveBeenCalled();
       expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
     });
 
-    it('returns error when resumeWorkflowRun throws', async () => {
-      const failedRun = makeRun({ id: 'prior-run', status: 'failed' });
-      const priorNodes = new Map([['node1', 'output1']]);
-      const store = makeStore({
-        findResumableRun: mock(async () => failedRun),
-        getCompletedDagNodeOutputs: mock(async () => priorNodes),
-        resumeWorkflowRun: mock(async () => {
-          throw new Error('Resume DB error');
-        }),
-      });
+    it('runs the dag-executor with priorCompletedNodes when caller supplies them', async () => {
+      const resumed = makeRun({ id: 'resumed-run', status: 'running' });
+      const priorCompletedNodes = new Map([
+        ['node-a', 'a-output'],
+        ['node-b', 'b-output'],
+      ]);
+      const store = makeStore();
       const deps = makeDeps(store);
-      const result = await executeWorkflow(
+      await executeWorkflow(
         deps,
         makePlatform(),
         'conv-1',
         '/tmp',
         makeWorkflow(),
         'test message',
-        'db-conv-1'
+        'db-conv-1',
+        { preCreatedRun: resumed, priorCompletedNodes }
       );
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('Database error resuming');
+      // dag-executor receives the priorCompletedNodes map at arg index 15.
+      // dag-executor signature: deps, platform, conversationId, cwd, workflow,
+      // workflowRun, provider, model, artifactsDir, logDir, baseBranch,
+      // docsDir, config, configuredCommandFolder, issueContext, priorCompletedNodes
+      const passedPriors = mockExecuteDagWorkflow.mock.calls[0]?.[15] as
+        | Map<string, string>
+        | undefined;
+      expect(passedPriors).toBe(priorCompletedNodes);
+      // No fresh row created when a preCreatedRun is supplied.
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
   });
 
@@ -727,11 +628,7 @@ describe('executeWorkflow', () => {
         makeWorkflow(),
         'test message',
         'db-conv-1',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        preRun
+        { preCreatedRun: preRun }
       );
       // Guards still run (no bypass)
       expect(store.getActiveWorkflowRunByPath).toHaveBeenCalled();
@@ -768,7 +665,7 @@ describe('executeWorkflow', () => {
         makeWorkflow(),
         'test message',
         'db-conv-1',
-        'codebase-1'
+        { codebaseId: 'codebase-1' }
       );
 
       // DB env vars should have been fetched for the codebaseId
@@ -799,6 +696,98 @@ describe('executeWorkflow', () => {
   });
 
   // -------------------------------------------------------------------------
+  // User provider env injection (per-user AI-provider credentials)
+  // -------------------------------------------------------------------------
+
+  describe('user provider env injection', () => {
+    it('skips injection when isPerUserProviderKeysEnabled returns false', async () => {
+      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => false,
+        getUserProviderEnv,
+      };
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        { userId: 'u-1' }
+      );
+      expect(getUserProviderEnv).not.toHaveBeenCalled();
+    });
+
+    it('skips injection when userId is absent even if feature is enabled', async () => {
+      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv,
+      };
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1'
+        // no userId
+      );
+      expect(getUserProviderEnv).not.toHaveBeenCalled();
+    });
+
+    it('merges user provider env LAST so it overrides DB env', async () => {
+      const store = makeStore({
+        getCodebaseEnvVars: mock(async () => ({ DB_KEY: 'db_val', SHARED_KEY: 'db' })),
+      });
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHARED_KEY: 'user_wins', USER_KEY: 'u_val' },
+        files: [] as { path: string; contents: string }[],
+      }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(store),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv,
+      };
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        { codebaseId: 'codebase-1', userId: 'u-1' }
+      );
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[12] as WorkflowConfig | undefined;
+      expect(configArg?.envVars).toMatchObject({
+        DB_KEY: 'db_val',
+        SHARED_KEY: 'user_wins',
+        USER_KEY: 'u_val',
+      });
+    });
+
+    it('returns {} and does not throw when getUserProviderEnv rejects', async () => {
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => {
+          throw new Error('network down');
+        }),
+      };
+      await expect(
+        executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+          userId: 'u-1',
+        })
+      ).resolves.toBeDefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Lock-token cleanup on pre-DAG failure paths (review #1)
   //
   // Any failure between row creation and DAG start that returns early must
@@ -807,43 +796,8 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('lock cleanup on failure paths', () => {
-    it('cancels pre-created row when resumeWorkflowRun throws', async () => {
-      const preCreated = makeRun({ id: 'pre-created-orphan', status: 'pending' });
-      const resumable = makeRun({ id: 'failed-prior-run', status: 'failed' });
-      const updateSpy = mock(async () => {});
-      const store = makeStore({
-        findResumableRun: mock(async () => resumable),
-        getCompletedDagNodeOutputs: mock(async () => new Map([['node1', 'out1']])),
-        resumeWorkflowRun: mock(async () => {
-          throw new Error('DB blew up during resume activation');
-        }),
-        updateWorkflowRun: updateSpy,
-      });
-      const deps = makeDeps(store);
-
-      const result = await executeWorkflow(
-        deps,
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow(),
-        'test',
-        'db-conv-1',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        preCreated
-      );
-
-      expect(result.success).toBe(false);
-      const cancelCall = updateSpy.mock.calls.find(
-        (call: unknown[]) =>
-          call[0] === 'pre-created-orphan' &&
-          (call[1] as { status?: string })?.status === 'cancelled'
-      );
-      expect(cancelCall).toBeDefined();
-    });
+    // resumeWorkflowRun DB-error coverage lives in the hydrateResumableRun
+    // suite — those errors surface at the caller now, not in the executor.
 
     it('cancels workflowRun when guard query throws (no zombie row)', async () => {
       const updateSpy = mock(async () => {});
@@ -950,5 +904,459 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('running 1m');
       expect(msg).toContain('Wait for it to finish');
     });
+  });
+});
+
+describe('finally backstop', () => {
+  it('calls failWorkflowRun when run is still running at finally', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const call = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('does not call failWorkflowRun when run already completed', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'completed' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const backstopCall = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(backstopCall).toBeUndefined();
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Telemetry wiring
+//
+// captureWorkflowCompleted is mocked as a no-op; these tests assert it actually
+// fires on the unhandled-throw path (and only there from the executor) and that
+// the WorkflowSource is threaded into executeDagWorkflow. Telemetry regressions
+// are otherwise invisible — a dropped call leaves no failing assertion.
+// ───────────────────────────────────────────────────────────────────────────
+describe('telemetry wiring', () => {
+  beforeEach(() => {
+    mockExecuteDagWorkflow.mockClear();
+    mockCaptureWorkflowCompleted.mockClear();
+    mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('captures workflow_failed with unhandled_error when executeDagWorkflow throws', async () => {
+    mockExecuteDagWorkflow.mockRejectedValueOnce(new Error('dag boom'));
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    // Exactly once — the executor catch must not double-emit with the DAG paths.
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed', exitReason: 'unhandled_error' })
+    );
+  });
+
+  it('reports feature-adoption booleans on workflow_invoked', async () => {
+    mockCaptureWorkflowInvoked.mockClear();
+    const store = makeStore();
+    const deps = makeDeps(store);
+    const workflow = makeWorkflow({
+      persist_sessions: true,
+      nodes: [
+        { id: 'gen', prompt: 'Generate.', output_format: { type: 'object' }, mcp: 'mcp.json' },
+        {
+          id: 'iterate',
+          depends_on: ['gen'],
+          loop: { prompt: 'Iterate.', until: 'DONE', fresh_context: true },
+        },
+        { id: 'summarize', depends_on: ['iterate'], prompt: 'Summarize.', output_type: 'report' },
+      ],
+    } as Partial<WorkflowDefinition>);
+
+    await executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', workflow, 'msg', 'db-conv-1');
+
+    expect(mockCaptureWorkflowInvoked).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowInvoked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        usesOutputFormat: true,
+        usesOutputType: true,
+        usesPersistSession: true,
+        usesMcp: true,
+        usesFreshContext: true,
+        usesSkills: false,
+      })
+    );
+  });
+
+  it('reports adoption booleans as false for a plain single-prompt workflow', async () => {
+    mockCaptureWorkflowInvoked.mockClear();
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(mockCaptureWorkflowInvoked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        usesOutputFormat: false,
+        usesOutputType: false,
+        usesPersistSession: false,
+        usesMcp: false,
+        usesSkills: false,
+        usesFreshContext: false,
+      })
+    );
+  });
+
+  it('does not fire executor-level completion telemetry on the success path', async () => {
+    // The DAG executor owns success/partial-failure telemetry; the executor's
+    // own captureWorkflowCompleted must fire only from the unhandled-throw catch.
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(mockCaptureWorkflowCompleted).not.toHaveBeenCalled();
+  });
+
+  it('threads source through to executeDagWorkflow (arg index 16)', async () => {
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1',
+      {
+        source: 'bundled',
+      }
+    );
+
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[16]).toBe('bundled');
+  });
+
+  it('resolves top-level workflow tier refs before calling the DAG executor', async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      loadConfig: mock(
+        async (): Promise<WorkflowConfig> => ({
+          assistant: 'claude',
+          assistants: { claude: {}, codex: {} },
+          baseBranch: '',
+          commands: { folder: '' },
+          tiers: {
+            large: { provider: 'codex', model: 'gpt-5.5', effort: 'high' },
+          },
+        })
+      ),
+    } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ model: 'large' }),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.5');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[17]).toEqual(
+      expect.objectContaining({
+        aliases: expect.objectContaining({
+          large: { provider: 'codex', model: 'gpt-5.5', effort: 'high' },
+        }),
+      })
+    );
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[18]).toEqual({
+      provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'high',
+    });
+  });
+
+  it('applies per-user AI prefs as the highest-precedence resolver layer', async () => {
+    const store = makeStore();
+    const getUserAiPrefs = mock(async () => ({
+      tiers: { large: { provider: 'codex', model: 'gpt-5.5', effort: 'high' } },
+    }));
+    const deps = {
+      ...makeDeps(store),
+      loadConfig: mock(
+        async (): Promise<WorkflowConfig> => ({
+          assistant: 'claude',
+          assistants: { claude: {}, codex: {} },
+          baseBranch: '',
+          commands: { folder: '' },
+          tiers: {
+            large: { provider: 'claude', model: 'opus' },
+          },
+        })
+      ),
+      getUserAiPrefs,
+    } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ model: 'large' }),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
+    expect(getUserAiPrefs).toHaveBeenCalledWith('user-1');
+    // User tier wins over the config tier for the same key.
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.5');
+  });
+
+  it('does not consult per-user AI prefs without a userId (solo unchanged)', async () => {
+    const store = makeStore();
+    const getUserAiPrefs = mock(async () => ({}));
+    const deps = { ...makeDeps(store), getUserAiPrefs } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(getUserAiPrefs).not.toHaveBeenCalled();
+  });
+
+  it('a throwing getUserAiPrefs dep degrades to config-only (run still starts)', async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      getUserAiPrefs: mock(async () => {
+        throw new Error('db down');
+      }),
+    } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ model: 'large' }),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
+    // Config default is claude → built-in tier defaults resolve 'large'.
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('claude');
+  });
+
+  it('structurally invalid stored prefs degrade to config-only (run still starts)', async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      // An alias without the '@' prefix makes buildAiProfile throw.
+      getUserAiPrefs: mock(async () => ({
+        aliases: { fast: { provider: 'claude', model: 'haiku' } },
+      })),
+    } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ model: 'large' }),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('claude');
+  });
+
+  it("per-user default provider rebases tier defaults for the run's profile", async () => {
+    const store = makeStore();
+    const deps = {
+      ...makeDeps(store),
+      getUserAiPrefs: mock(async () => ({ defaultProvider: 'codex' })),
+    } as WorkflowDeps;
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ model: 'large' }),
+      'msg',
+      'db-conv-1',
+      { userId: 'user-1' }
+    );
+
+    // No tiers configured anywhere → built-in tier defaults follow the
+    // user's default provider, not the install config's.
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+  });
+
+  it('passes undefined source when the caller does not supply one', async () => {
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[16]).toBeUndefined();
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// hydrateResumableRun
+//
+// Resume preparation is a caller-side primitive: callers look up the
+// candidate themselves (via findResumableRun or
+// findResumableRunByParentConversation) and call hydrateResumableRun to
+// turn it into the form executeWorkflow expects. The executor only consumes
+// what this returns.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('hydrateResumableRun', () => {
+  it('returns hydrated run + prior outputs for a candidate with completed nodes', async () => {
+    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
+    const resumed = makeRun({ id: 'prior-failed', status: 'running' });
+    const priorNodes = new Map([['n1', 'out1']]);
+    const store = makeStore({
+      getCompletedDagNodeOutputs: mock(async () => priorNodes),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.preCreatedRun).toBe(resumed);
+    expect(result?.priorCompletedNodes).toBe(priorNodes);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('prior-failed');
+  });
+
+  it('returns null when candidate has no completed nodes and no interactive-loop state', async () => {
+    const candidate = makeRun({ id: 'empty-prior', status: 'failed' });
+    const store = makeStore({
+      getCompletedDagNodeOutputs: mock(async () => new Map()),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).toBeNull();
+    // Must not transition the run — there is nothing to resume.
+    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('returns hydrated run when interactive-loop state is present even with zero completed nodes', async () => {
+    const candidate = makeRun({
+      id: 'paused-loop',
+      status: 'paused',
+      metadata: { approval: { type: 'interactive_loop', nodeId: 'loop-1', iteration: 2 } },
+    });
+    const resumed = makeRun({ id: 'paused-loop', status: 'running' });
+    const store = makeStore({
+      getCompletedDagNodeOutputs: mock(async () => new Map()),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes.size).toBe(0);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
+  });
+
+  it('propagates DB errors from getCompletedDagNodeOutputs (no silent fallback)', async () => {
+    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
+    const store = makeStore({
+      getCompletedDagNodeOutputs: mock(async () => {
+        throw new Error('DB read failed');
+      }),
+    });
+    const deps = makeDeps(store);
+    await expect(hydrateResumableRun(deps, candidate)).rejects.toThrow('DB read failed');
+  });
+
+  it('propagates DB errors from resumeWorkflowRun (no silent fallback)', async () => {
+    const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
+    const store = makeStore({
+      getCompletedDagNodeOutputs: mock(async () => new Map([['n1', 'v1']])),
+      resumeWorkflowRun: mock(async () => {
+        throw new Error('DB write failed');
+      }),
+    });
+    const deps = makeDeps(store);
+    await expect(hydrateResumableRun(deps, candidate)).rejects.toThrow('DB write failed');
   });
 });

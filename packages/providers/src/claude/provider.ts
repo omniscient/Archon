@@ -8,9 +8,15 @@
  * - Content blocks are typed via inline assertions for clarity
  *
  * Authentication:
- * - CLAUDE_USE_GLOBAL_AUTH=true: Use global auth from `claude /login`, filter env tokens
- * - CLAUDE_USE_GLOBAL_AUTH=false: Use explicit tokens from env vars
- * - Not set: Auto-detect - use tokens if present in env, otherwise global auth
+ * - Credentials reach the subprocess via process.env (already cleaned by
+ *   stripCwdEnv) PLUS any per-request `requestOptions.env` (per-user delivered
+ *   keys/subscriptions), merged LAST so it wins. `buildSubprocessEnv` does NOT
+ *   filter tokens — it only logs which posture process.env shows (explicit
+ *   token present vs not); the historical env-token allowlist was removed in
+ *   #1067, so the log can read "global" while a per-request token authenticates.
+ * - CLAUDE_USE_GLOBAL_AUTH is an Archon-only boot sentinel (set for solo
+ *   installs with no creds — see server/src/boot/claude-auth-posture.ts). The
+ *   Claude CLI itself ignores it; it neither gates nor filters env here.
  *
  * Binary resolution:
  * - In compiled binaries, `pathToClaudeCodeExecutable` is resolved from
@@ -39,9 +45,10 @@ import type {
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
+import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
-import { readFile } from 'fs/promises';
-import { resolve, isAbsolute } from 'path';
+import { loadMcpConfig } from '../mcp/config';
+import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -203,96 +210,6 @@ export function getProcessUid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 
-// ─── MCP Config Loading (absorbed from dag-executor) ───────────────────────
-
-/**
- * Expand $VAR_NAME references in string-valued records from process.env.
- */
-function expandEnvVarsInRecord(
-  record: Record<string, unknown>,
-  missingVars: string[]
-): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, val] of Object.entries(record)) {
-    if (typeof val !== 'string') {
-      getLog().warn({ key, valueType: typeof val }, 'mcp_env_value_coerced_to_string');
-      result[key] = String(val);
-      continue;
-    }
-    result[key] = val.replace(/\$([A-Z_][A-Z0-9_]*)/g, (_, varName: string) => {
-      const envVal = process.env[varName];
-      if (envVal === undefined) {
-        missingVars.push(varName);
-      }
-      return envVal ?? '';
-    });
-  }
-  return result;
-}
-
-function expandEnvVars(config: Record<string, unknown>): {
-  expanded: Record<string, unknown>;
-  missingVars: string[];
-} {
-  const result: Record<string, unknown> = {};
-  const missingVars: string[] = [];
-  for (const [serverName, serverConfig] of Object.entries(config)) {
-    if (typeof serverConfig !== 'object' || serverConfig === null) {
-      getLog().warn({ serverName, valueType: typeof serverConfig }, 'mcp_server_config_not_object');
-      continue;
-    }
-    const server = { ...(serverConfig as Record<string, unknown>) };
-    if (server.env && typeof server.env === 'object') {
-      server.env = expandEnvVarsInRecord(server.env as Record<string, unknown>, missingVars);
-    }
-    if (server.headers && typeof server.headers === 'object') {
-      server.headers = expandEnvVarsInRecord(
-        server.headers as Record<string, unknown>,
-        missingVars
-      );
-    }
-    result[serverName] = server;
-  }
-  return { expanded: result, missingVars };
-}
-
-/**
- * Load MCP server config from a JSON file and expand environment variables.
- */
-export async function loadMcpConfig(
-  mcpPath: string,
-  cwd: string
-): Promise<{ servers: Record<string, unknown>; serverNames: string[]; missingVars: string[] }> {
-  const fullPath = isAbsolute(mcpPath) ? mcpPath : resolve(cwd, mcpPath);
-
-  let raw: string;
-  try {
-    raw = await readFile(fullPath, 'utf-8');
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === 'ENOENT') {
-      throw new Error(`MCP config file not found: ${mcpPath} (resolved to ${fullPath})`);
-    }
-    throw new Error(`Failed to read MCP config file: ${mcpPath} — ${e.message}`);
-  }
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
-  } catch (parseErr) {
-    const detail = (parseErr as SyntaxError).message;
-    throw new Error(`MCP config file is not valid JSON: ${mcpPath} — ${detail}`);
-  }
-
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`MCP config must be a JSON object (Record<string, ServerConfig>): ${mcpPath}`);
-  }
-
-  const { expanded, missingVars } = expandEnvVars(parsed);
-  const serverNames = Object.keys(expanded);
-  return { servers: expanded, serverNames, missingVars };
-}
-
 // ─── SDK Hooks Building (absorbed from dag-executor) ───────────────────────
 
 /** YAML hook matcher shape (matches @archon/workflows/schemas/dag-node WorkflowNodeHooks) */
@@ -436,19 +353,20 @@ async function applyNodeConfig(
   if (nodeConfig.skills) {
     const skills = nodeConfig.skills;
     const agentId = 'dag-node-skills';
-    const agentTools = options.tools ? [...(options.tools as string[]), 'Skill'] : ['Skill'];
     const agentDef: {
       description: string;
       prompt: string;
       skills: string[];
-      tools: string[];
+      tools?: string[];
       model?: string;
     } = {
       description: 'DAG node with skills',
       prompt: `You have preloaded skills: ${skills.join(', ')}. Use them when relevant.`,
       skills,
-      tools: agentTools,
     };
+    if (options.tools) {
+      agentDef.tools = [...(options.tools as string[]), 'Skill'];
+    }
     if (options.model) agentDef.model = options.model;
     options.agents = { [agentId]: agentDef };
     options.agent = agentId;
@@ -525,6 +443,21 @@ async function applyNodeConfig(
   // fallbackModel from nodeConfig
   if (nodeConfig.fallbackModel !== undefined) {
     options.fallbackModel = nodeConfig.fallbackModel;
+  }
+
+  // Phase 4 of #975 — enable AI-generated progress summaries for subagents
+  // spawned by workflow nodes. Without this, `task_progress` events arrive
+  // every ~30s with just `description` + `last_tool_name`; with it, the SDK
+  // forks the subagent's session every ~30s to produce a short present-tense
+  // `summary` (e.g. "Analyzing auth module"). The fork reuses the subagent's
+  // model + prompt cache, so cost stays minimal. Only workflow nodes opt in —
+  // direct chat calls (no nodeConfig) skip this to keep the chat surface
+  // unchanged. Authors can still override per-node by setting
+  // `agentProgressSummaries: false` in nodeConfig (see below).
+  if (nodeConfig.agentProgressSummaries !== undefined) {
+    options.agentProgressSummaries = nodeConfig.agentProgressSummaries;
+  } else {
+    options.agentProgressSummaries = true;
   }
 
   return warnings;
@@ -622,7 +555,7 @@ function buildBaseClaudeOptions(
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
-    settingSources: assistantDefaults.settingSources ?? ['project'],
+    settingSources: assistantDefaults.settingSources ?? ['project', 'user'],
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
@@ -759,13 +692,103 @@ async function* streamClaudeMessages(
       const sysMsg = msg as {
         subtype?: string;
         mcp_servers?: { name: string; status: string }[];
+        // Subagent task lifecycle (Claude SDK v0.2.89+)
+        task_id?: string;
+        tool_use_id?: string;
+        description?: string;
+        task_type?: string;
+        prompt?: string;
+        summary?: string;
+        usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+        last_tool_name?: string;
+        status?: string;
+        output_file?: string;
+        skip_transcript?: boolean;
+        // Hook lifecycle (Claude SDK v0.2.89+)
+        hook_id?: string;
+        hook_name?: string;
+        hook_event?: string;
+        outcome?: 'success' | 'error' | 'cancelled';
+        exit_code?: number;
       };
-      if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+      const subtype = sysMsg.subtype;
+      if (subtype === 'init' && sysMsg.mcp_servers) {
         const failed = sysMsg.mcp_servers.filter(s => s.status !== 'connected');
         if (failed.length > 0) {
           const names = failed.map(s => `${s.name} (${s.status})`).join(', ');
           yield { type: 'system', content: `MCP server connection failed: ${names}` };
         }
+      } else if (subtype === 'task_started' && sysMsg.task_id) {
+        // Ambient / housekeeping tasks (SDK signals via skip_transcript) are
+        // SDK-internal — they bloat the Web UI's tasks panel without telling
+        // the user anything actionable. Drop them at the provider boundary;
+        // the workflow executor and SSE bridge never see them.
+        if (sysMsg.skip_transcript === true) {
+          getLog().debug(
+            { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
+            'claude.task_started_housekeeping_suppressed'
+          );
+        } else {
+          yield {
+            type: 'task_started',
+            taskId: sysMsg.task_id,
+            description: sysMsg.description ?? '',
+            ...(sysMsg.task_type !== undefined ? { taskType: sysMsg.task_type } : {}),
+            ...(sysMsg.prompt !== undefined ? { prompt: sysMsg.prompt } : {}),
+            ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+          };
+        }
+      } else if (subtype === 'task_progress' && sysMsg.task_id) {
+        yield {
+          type: 'task_progress',
+          taskId: sysMsg.task_id,
+          description: sysMsg.description ?? '',
+          ...(sysMsg.summary !== undefined ? { summary: sysMsg.summary } : {}),
+          ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
+          ...(sysMsg.last_tool_name !== undefined ? { lastToolName: sysMsg.last_tool_name } : {}),
+          ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+        };
+      } else if (subtype === 'task_notification' && sysMsg.task_id) {
+        const status = sysMsg.status;
+        if (status !== 'completed' && status !== 'failed' && status !== 'stopped') {
+          getLog().warn(
+            { taskId: sysMsg.task_id, status },
+            'claude.task_notification_unknown_status'
+          );
+          // Fall through with raw status to avoid dropping the event entirely
+        }
+        yield {
+          type: 'task_notification',
+          taskId: sysMsg.task_id,
+          status:
+            status === 'completed' || status === 'failed' || status === 'stopped'
+              ? status
+              : 'stopped',
+          summary: sysMsg.summary ?? '',
+          outputFile: sysMsg.output_file ?? '',
+          ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
+          ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+        };
+      } else if (subtype === 'hook_started' && sysMsg.hook_id) {
+        yield {
+          type: 'hook_started',
+          hookId: sysMsg.hook_id,
+          hookName: sysMsg.hook_name ?? '',
+          hookEvent: sysMsg.hook_event ?? '',
+        };
+      } else if (subtype === 'hook_response' && sysMsg.hook_id) {
+        const outcome = sysMsg.outcome;
+        yield {
+          type: 'hook_response',
+          hookId: sysMsg.hook_id,
+          hookName: sysMsg.hook_name ?? '',
+          hookEvent: sysMsg.hook_event ?? '',
+          outcome:
+            outcome === 'success' || outcome === 'error' || outcome === 'cancelled'
+              ? outcome
+              : 'error',
+          ...(sysMsg.exit_code !== undefined ? { exitCode: sysMsg.exit_code } : {}),
+        };
       } else {
         getLog().debug({ subtype: sysMsg.subtype }, 'claude.system_message_unhandled');
       }
@@ -810,7 +833,14 @@ async function* streamClaudeMessages(
       const modelUsage = resultMsg.modelUsage ?? resultMsg.model_usage;
       const tokens = normalizeClaudeUsage(resultMsg.usage);
       const sdkErrors = Array.isArray(resultMsg.errors) ? resultMsg.errors : undefined;
-      if (resultMsg.is_error) {
+      // SDKResultSuccess declares `is_error: boolean` (not literal false). When a
+      // model terminates via a configured stop sequence (stop_reason ===
+      // 'stop_sequence') the SDK can set is_error: true while keeping
+      // subtype: 'success' — its encoding of "non-default termination, not a
+      // failure". Treat that pair as a clean success so downstream consumers
+      // (which gate failure on isError) don't misclassify it.
+      const isRealError = resultMsg.is_error === true && resultMsg.subtype !== 'success';
+      if (isRealError) {
         getLog().error(
           {
             sessionId: resultMsg.session_id,
@@ -820,6 +850,14 @@ async function* streamClaudeMessages(
           },
           'claude.result_is_error'
         );
+      } else if (resultMsg.is_error === true && resultMsg.subtype === 'success') {
+        getLog().debug(
+          {
+            sessionId: resultMsg.session_id,
+            stopReason: resultMsg.stop_reason,
+          },
+          'claude.result_success_validated'
+        );
       }
       yield {
         type: 'result',
@@ -828,8 +866,8 @@ async function* streamClaudeMessages(
         ...(resultMsg.structured_output !== undefined
           ? { structuredOutput: resultMsg.structured_output }
           : {}),
-        ...(resultMsg.is_error ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
-        ...(resultMsg.is_error && sdkErrors?.length ? { errors: sdkErrors } : {}),
+        ...(isRealError ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
+        ...(isRealError && sdkErrors?.length ? { errors: sdkErrors } : {}),
         ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
         ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
         ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),
@@ -1004,6 +1042,19 @@ export class ClaudeProvider implements IAgentProvider {
         await applyNodeConfig(options, requestOptions.nodeConfig, cwd);
       }
 
+      // 2b. Register in-process native tools (e.g. manage_run) as an archon MCP
+      //     server, mirroring the file-based mcp branch. Merge so a nodeConfig
+      //     mcp config and native tools can coexist.
+      if (requestOptions?.nativeTools && requestOptions.nativeTools.length > 0) {
+        const server = buildArchonMcpServer(requestOptions.nativeTools);
+        options.mcpServers = { ...(options.mcpServers ?? {}), [ARCHON_TOOL_SERVER]: server };
+        options.allowedTools = [...(options.allowedTools ?? []), `mcp__${ARCHON_TOOL_SERVER}__*`];
+        getLog().info(
+          { count: requestOptions.nativeTools.length },
+          'claude.native_tools_registered'
+        );
+      }
+
       // 3. Set session resume
       if (resumeSessionId) {
         options.resume = resumeSessionId;
@@ -1026,7 +1077,13 @@ export class ClaudeProvider implements IAgentProvider {
         const events = withFirstMessageTimeout(rawEvents, controller, timeoutMs, diagnostics);
 
         // 5. Stream normalized events
-        yield* streamClaudeMessages(events, toolResultQueue);
+        // Claude resumes-or-errors: an invalid resume id throws (and is
+        // retried/surfaced), so reaching the result stream means the prior
+        // session was restored. Hence `true` whenever a resume was requested.
+        yield* withResumedOutcome(
+          streamClaudeMessages(events, toolResultQueue),
+          resumedOutcome(resumeSessionId, true)
+        );
         return;
       } catch (error) {
         const err = error as Error;

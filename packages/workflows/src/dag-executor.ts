@@ -5,8 +5,9 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
+import { writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { isAbsolute, resolve as resolvePath } from 'path';
+import { isAbsolute, join as joinPath, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import type {
@@ -25,6 +26,7 @@ import {
   getProviderCapabilities,
   getRegisteredProviders,
   isRegisteredProvider,
+  validateStructuredOutput,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -40,6 +42,7 @@ import type {
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
+  WorkflowSource,
 } from './schemas';
 import {
   isBashNode,
@@ -50,9 +53,12 @@ import {
   isApprovalContext,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, captureWorkflowCompleted } from '@archon/paths';
+import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { evaluateCondition } from './condition-evaluator';
+import { declaredFieldsFromSchema, resolveNodeOutputField } from './output-ref';
+import { writeNodeArtifact } from './artifacts-index';
 import {
   logNodeStart,
   logNodeComplete,
@@ -66,6 +72,7 @@ import {
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import {
   classifyError,
+  toTelemetryErrorClass,
   detectCreditExhaustion,
   loadCommandPrompt,
   substituteWorkflowVariables,
@@ -75,7 +82,78 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   execBashScript,
+  safeSendMessage,
+  type SendMessageContext,
 } from './executor-shared';
+import {
+  isLiteralSpec,
+  isTierName,
+  resolveModelSpec,
+  routePresetEffort,
+  type ModelAliasPreset,
+  type ResolvedAiProfile,
+  type TierName,
+} from './model-validation';
+
+/**
+ * Closed-set node type for telemetry — mirrors the DagNode discriminators.
+ * The final `'prompt'` arm is the fallthrough: a future node type added to
+ * the schema without a guard here would be reported as `'prompt'` (a metrics
+ * misclassification, not a privacy issue) — extend this when adding node types.
+ */
+function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
+  if (isBashNode(node)) return 'bash';
+  if (isScriptNode(node)) return 'script';
+  if (isLoopNode(node)) return 'loop';
+  if (isApprovalNode(node)) return 'approval';
+  if (isCancelNode(node)) return 'cancel';
+  if ('command' in node) return 'command';
+  return 'prompt';
+}
+
+/**
+ * Usage totals for the terminal telemetry event. Fields are omitted (not sent
+ * as zero) when nothing was reported, so absence in PostHog means "providers
+ * reported no usage", never "zero spend".
+ */
+function buildRunUsageProps(totals: {
+  costUsd: number;
+  tokensIn: number;
+  tokensOut: number;
+  loopIterations: number;
+}): { costUsd?: number; tokensIn?: number; tokensOut?: number; loopIterations?: number } {
+  return {
+    ...(totals.costUsd > 0 ? { costUsd: totals.costUsd } : {}),
+    ...(totals.tokensIn > 0 || totals.tokensOut > 0
+      ? { tokensIn: totals.tokensIn, tokensOut: totals.tokensOut }
+      : {}),
+    ...(totals.loopIterations > 0 ? { loopIterations: totals.loopIterations } : {}),
+  };
+}
+
+/**
+ * Failure taxonomy for the terminal telemetry event: the first failed node's
+ * type and a fixed-enum error class derived from its stored error message.
+ * Returns {} when nothing failed. Categorical only — the error text itself
+ * is classified locally and never transmitted.
+ */
+function firstFailedNodeTaxonomy(
+  nodeOutputs: Map<string, NodeOutput>,
+  nodes: readonly DagNode[]
+): { errorClass?: WorkflowErrorClass; failedNodeType?: WorkflowNodeType } {
+  for (const [nodeId, output] of nodeOutputs) {
+    if (output.state !== 'failed') continue;
+    const node = nodes.find(n => n.id === nodeId);
+    const taxonomy: { errorClass: WorkflowErrorClass; failedNodeType?: WorkflowNodeType } = {
+      errorClass: toTelemetryErrorClass(classifyError(new Error(output.error))),
+    };
+    if (node) {
+      taxonomy.failedNodeType = dagNodeTelemetryType(node);
+    }
+    return taxonomy;
+  }
+  return {};
+}
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -92,6 +170,50 @@ const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
 export interface McpFailureEntry {
   name: string;
   segment: string;
+}
+
+function applyPresetOptions(
+  provider: string,
+  preset: ModelAliasPreset | undefined,
+  node: DagNode,
+  workflowLevelOptions: WorkflowLevelOptions,
+  nodeConfig: NodeConfig,
+  assistantConfig: Record<string, unknown>
+): void {
+  if (!preset) return;
+
+  if (
+    preset.thinking !== undefined &&
+    node.thinking === undefined &&
+    workflowLevelOptions.thinking === undefined
+  ) {
+    nodeConfig.thinking = preset.thinking;
+  }
+
+  if (
+    preset.effort === undefined ||
+    node.effort !== undefined ||
+    workflowLevelOptions.effort !== undefined
+  ) {
+    return;
+  }
+
+  const routed = routePresetEffort(provider, preset.effort);
+  if (!routed) {
+    // Cross-provider effort mismatch (e.g. a `tiers:` entry sets `effort: max`
+    // on a Codex tier). Warn rather than silently drop it — fail-loud per the
+    // project's fail-fast guideline.
+    getLog().warn(
+      { provider, effort: preset.effort, nodeId: node.id },
+      'dag.preset_effort_unsupported'
+    );
+    return;
+  }
+  if (routed.field === 'effort') {
+    nodeConfig.effort = routed.value;
+  } else {
+    assistantConfig.modelReasoningEffort = routed.value;
+  }
 }
 
 /**
@@ -154,13 +276,18 @@ interface WorkflowLevelOptions {
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
+  /** Workflow-level tier keyword (when `workflow.model` is small/medium/large), so
+   *  nodes that inherit the workflow model can still surface the `← tier` annotation. */
+  workflowTier?: 'small' | 'medium' | 'large';
 }
 
-/** Internal node execution result — extends NodeOutput with cost/token data for aggregation. */
+/** Internal node execution result — extends NodeOutput with cost data for aggregation. */
 type NodeExecutionResult = NodeOutput & {
   costUsd?: number;
+  /** Provider-reported token usage for the node (loop nodes: summed across iterations). */
   tokens?: TokenUsage;
-  modelUsage?: Record<string, unknown>;
+  /** Loop nodes only: number of iterations executed. */
+  loopIterations?: number;
 };
 
 /** Throttle state for cancel checks (reads — no write contention in WAL mode) */
@@ -191,15 +318,17 @@ export function shouldContinueStreamingForStatus(status: string | null): boolean
 const lastNodeActivityUpdate = new Map<string, number>();
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 60_000;
 
-/** Context for platform message sending */
-interface SendMessageContext {
-  workflowId?: string;
-  nodeName?: string;
-}
-
 /** Default DAG node retry for TRANSIENT errors */
 const DEFAULT_NODE_MAX_RETRIES = 2;
 const DEFAULT_NODE_RETRY_DELAY_MS = 3000;
+
+/**
+ * Max validate-and-reask attempts for a `best-effort` provider whose structured
+ * output fails schema validation (separate from transient-error retries above).
+ * Enforced providers don't reask — a validation failure there is a genuine edge
+ * (refusal / max_tokens truncation) and fails fast.
+ */
+const STRUCTURED_OUTPUT_MAX_REASKS = 3;
 
 /**
  * Get effective retry config for a DAG node.
@@ -235,49 +364,39 @@ function isTransientNodeError(errorMessage: string): boolean {
 }
 
 /**
- * Safely send a message to the platform without crashing on failure.
- * Returns true if message was sent successfully, false otherwise.
- */
-async function safeSendMessage(
-  platform: IWorkflowPlatform,
-  conversationId: string,
-  message: string,
-  context?: SendMessageContext,
-  metadata?: WorkflowMessageMetadata
-): Promise<boolean> {
-  try {
-    await platform.sendMessage(conversationId, message, metadata);
-    return true;
-  } catch (error) {
-    const err = error as Error;
-    const errorType = classifyError(err);
-
-    getLog().error(
-      {
-        err,
-        conversationId,
-        messageLength: message.length,
-        errorType,
-        platformType: platform.getPlatformType(),
-        ...context,
-      },
-      'dag_node_message_send_failed'
-    );
-
-    if (errorType === 'FATAL') {
-      throw new Error(`Platform authentication/permission error: ${err.message}`);
-    }
-
-    return false;
-  }
-}
-
-/**
  * Single-quote a string for safe inline shell use.
  * Replaces each ' with '\'' (end quote, literal single-quote, re-open quote).
  */
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Shell-quote a value for bash, or write it to a file and return a $(cat ...) reference
+ * when the value exceeds the inline size threshold.
+ */
+function shellQuoteOrFile(
+  value: string,
+  nodeId: string,
+  field: string | undefined,
+  outputFileDir: string | undefined
+): string {
+  if (outputFileDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
+    const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
+    const filePath = joinPath(outputFileDir, filename);
+    try {
+      writeFileSync(filePath, value);
+      return `$(cat ${shellQuote(filePath)})`;
+    } catch (fileErr) {
+      const err = fileErr as Error;
+      getLog().error(
+        { err, nodeId, field, valueSize: value.length, filePath },
+        'dag.large_output_file_write_failed'
+      );
+      return shellQuote(value); // fallback: inline (pre-file-spill behavior)
+    }
+  }
+  return shellQuote(value);
 }
 
 /**
@@ -291,7 +410,8 @@ function shellQuote(value: string): string {
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
-  escapedForBash = false
+  escapedForBash = false,
+  outputFileDir?: string
 ): string {
   return prompt.replace(
     /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
@@ -302,30 +422,36 @@ export function substituteNodeOutputRefs(
         return escapedForBash ? "''" : '';
       }
       if (!field) {
-        return escapedForBash ? shellQuote(nodeOutput.output) : nodeOutput.output;
+        return escapedForBash
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          : nodeOutput.output;
       }
-      try {
-        const parsed = JSON.parse(nodeOutput.output) as Record<string, unknown>;
-        const value = parsed[field];
-        if (typeof value === 'string') return escapedForBash ? shellQuote(value) : value;
-        // numbers and booleans from JSON.parse are shell-safe without quoting:
-        // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
-        // String(boolean) is 'true' or 'false' — no shell metacharacters.
-        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-        return escapedForBash ? "''" : ''; // objects, null, undefined, symbol, bigint → empty
-      } catch (jsonErr) {
-        getLog().warn(
-          { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
-          'dag_node_output_ref_json_parse_failed'
-        );
-        return escapedForBash ? "''" : '';
-      }
+      // No-silent-drop field access (resolveNodeOutputField): prefers the parsed
+      // structuredOutput payload, falls back to parsing `output`, and THROWS an
+      // OutputRefError for an unresolvable reference (field not in the producer's
+      // declared schema, or a schemaless node whose output isn't JSON / lacks the
+      // key). The throw propagates to the dag-executor's per-node catch → the
+      // consuming node fails visibly instead of receiving a poisoned ''. The only
+      // value that resolves to empty is an author-declared-optional field.
+      const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
+      if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
+      const value = resolution.value;
+      if (typeof value === 'string')
+        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
+      // numbers and booleans are shell-safe without quoting: JSON disallows
+      // NaN/Infinity so String(number) is digits/sign/'.', and String(boolean) is
+      // 'true'/'false' — no shell metacharacters.
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      // arrays and objects: JSON-stringify so downstream tools (jq, etc.) get a
+      // single JSON literal argument.
+      const json = JSON.stringify(value);
+      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
     }
   );
 }
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
-// loadMcpConfig moved to @archon/providers/src/claude/provider.ts
+// loadMcpConfig moved to @archon/providers/src/mcp/config.ts
 
 /**
  * Resolve per-node provider and model.
@@ -344,15 +470,58 @@ async function resolveNodeProviderAndModel(
   conversationId: string,
   workflowRunId: string,
   _cwd: string,
-  workflowLevelOptions: WorkflowLevelOptions
+  workflowLevelOptions: WorkflowLevelOptions,
+  aiProfile?: ResolvedAiProfile,
+  workflowPreset?: ModelAliasPreset
 ): Promise<{
   provider: string;
   model: string | undefined;
   options: SendQueryOptions | undefined;
+  tier?: TierName;
 }> {
-  // Provider is explicit: node.provider ?? workflow.provider. Model never
-  // influences provider selection. Model strings pass through to the SDK.
-  const provider: string = node.provider ?? workflowProvider;
+  const configuredProvider: string = node.provider ?? workflowProvider;
+  let provider: string = configuredProvider;
+  let preset: ModelAliasPreset | undefined;
+  let model: string | undefined;
+
+  if (node.model) {
+    if (aiProfile) {
+      const modelSpec = resolveModelSpec(aiProfile, node.model);
+      if (isLiteralSpec(modelSpec)) {
+        model = modelSpec.literal;
+      } else {
+        preset = modelSpec;
+        provider = modelSpec.provider;
+        model = modelSpec.model;
+        if (node.provider && node.provider !== provider) {
+          getLog().warn(
+            {
+              nodeId: node.id,
+              configuredProvider: node.provider,
+              resolvedProvider: provider,
+              modelRef: node.model,
+            },
+            'dag.model_provider_conflict'
+          );
+          const delivered = await safeSendMessage(
+            platform,
+            conversationId,
+            `Warning: Node '${node.id}' sets provider '${node.provider}' but model '${node.model}' resolves to provider '${provider}' — using '${provider}'.`,
+            { workflowId: workflowRunId, nodeName: node.id }
+          );
+          if (!delivered) {
+            getLog().error(
+              { nodeId: node.id, workflowRunId },
+              'dag.model_provider_conflict_warning_delivery_failed'
+            );
+          }
+        }
+      }
+    } else {
+      model = node.model;
+    }
+  }
+
   if (!isRegisteredProvider(provider)) {
     throw new Error(
       `Node '${node.id}': unknown provider '${provider}'. ` +
@@ -363,11 +532,12 @@ async function resolveNodeProviderAndModel(
   }
 
   const providerAssistantConfig = config.assistants[provider];
-  const model: string | undefined =
-    node.model ??
-    (provider === workflowProvider
+  model ??=
+    provider === workflowProvider
       ? workflowModel
-      : (providerAssistantConfig?.model as string | undefined));
+      : (providerAssistantConfig?.model as string | undefined);
+  const effectivePreset =
+    preset ?? (!node.model && provider === workflowProvider ? workflowPreset : undefined);
 
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
@@ -448,6 +618,7 @@ async function resolveNodeProviderAndModel(
 
   // Build raw nodeConfig — provider translates internally
   const nodeConfig: NodeConfig = {
+    nodeId: node.id,
     mcp: node.mcp,
     hooks: node.hooks,
     skills: node.skills,
@@ -465,7 +636,15 @@ async function resolveNodeProviderAndModel(
   };
 
   // Pass assistantConfig from config — provider parses internally
-  const assistantConfig = config.assistants[provider] ?? {};
+  const assistantConfig: Record<string, unknown> = { ...(config.assistants[provider] ?? {}) };
+  applyPresetOptions(
+    provider,
+    effectivePreset,
+    node,
+    workflowLevelOptions,
+    nodeConfig,
+    assistantConfig
+  );
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -473,7 +652,18 @@ async function resolveNodeProviderAndModel(
     assistantConfig,
   };
 
-  return { provider, model, options };
+  // `node.model` is the original ref (e.g. "large"); `model` is the resolved
+  // string (e.g. "opus"). Surface `tier` when the ref was a tier keyword — from
+  // the node's own `model`, or (when the node inherits the workflow-level model)
+  // from the workflow tier, mirroring the effectivePreset inheritance condition.
+  const tier: 'small' | 'medium' | 'large' | undefined =
+    node.model && isTierName(node.model)
+      ? node.model
+      : !node.model && provider === workflowProvider
+        ? workflowLevelOptions.workflowTier
+        : undefined;
+
+  return { provider, model, options, tier };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -581,7 +771,9 @@ async function executeNodeInternal(
   nodeOutputs: Map<string, NodeOutput>,
   resumeSessionId: string | undefined,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  resolvedModel?: string,
+  resolvedTier?: TierName
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -596,7 +788,7 @@ async function executeNodeInternal(
       workflow_run_id: workflowRun.id,
       event_type: 'node_started',
       step_name: node.id,
-      data: { command: node.command ?? null, provider },
+      data: { command: node.command ?? null, provider, model: resolvedModel, tier: resolvedTier },
     })
     .catch((err: Error) => {
       getLog().error(
@@ -611,6 +803,9 @@ async function executeNodeInternal(
     runId: workflowRun.id,
     nodeId: node.id,
     nodeName: node.command ?? node.id,
+    provider,
+    model: resolvedModel,
+    tier: resolvedTier,
   });
 
   // Load prompt
@@ -683,6 +878,7 @@ async function executeNodeInternal(
   let nodeOutputText = ''; // Always accumulate regardless of streaming mode
   let structuredOutput: unknown;
   let newSessionId: string | undefined;
+  let nodeResumed: boolean | undefined;
   let nodeTokens: TokenUsage | undefined;
   let nodeCostUsd: number | undefined;
   let nodeStopReason: string | undefined;
@@ -703,9 +899,32 @@ async function executeNodeInternal(
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
-  try {
+  // Best-effort providers (Pi/Copilot) get a bounded validate-and-reask loop: on a
+  // structured-output validation miss, re-run the stream with the schema errors
+  // appended. Enforced providers and non-output_format nodes get 0 reasks.
+  const maxReasks =
+    getProviderCapabilities(provider).structuredOutput === 'best-effort' &&
+    nodeOptions?.outputFormat
+      ? STRUCTURED_OUTPUT_MAX_REASKS
+      : 0;
+  let accumulatedCostUsd: number | undefined;
+
+  // One sendQuery stream pass. Resets the per-attempt accumulators it mutates
+  // (output text, structured output, the batched-message buffer, per-pass cost,
+  // idle-timeout flag) so a prior reask attempt's state never leaks into this one,
+  // then streams. Throws on SDK error / budget cap (propagates to the outer catch
+  // — those failures are never reasked).
+  const runStreamPass = async (
+    attemptPrompt: string,
+    attemptResumeId: string | undefined
+  ): Promise<void> => {
+    nodeOutputText = '';
+    structuredOutput = undefined;
+    batchMessages.length = 0; // else a failed attempt's prose flushes during reask
+    nodeCostUsd = undefined;
+    nodeIdleTimedOut = false;
     for await (const msg of withIdleTimeout(
-      aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
+      aiClient.sendQuery(attemptPrompt, cwd, attemptResumeId, nodeOptionsWithAbort),
       effectiveIdleTimeout,
       () => {
         nodeIdleTimedOut = true;
@@ -884,6 +1103,7 @@ async function executeNodeInternal(
           lastToolStartedAt = null;
         }
         if (msg.sessionId) newSessionId = msg.sessionId;
+        if (msg.resumed !== undefined) nodeResumed = msg.resumed;
         if (msg.tokens) nodeTokens = msg.tokens;
         if (msg.cost !== undefined) nodeCostUsd = msg.cost;
         if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
@@ -903,8 +1123,13 @@ async function executeNodeInternal(
         }
         // Fail loudly on any other SDK error result. Previously we broke out of
         // the stream silently, producing empty/partial output without signaling
-        // failure — which let failed iterations masquerade as successes (#1208).
-        if (msg.isError) {
+        // failure — which let failed iterations masquerade as successes.
+        // Exception: errorSubtype === 'success' is the Claude SDK's marker for a
+        // clean stop_sequence termination. The Claude provider already filters
+        // this out, but the guard here keeps a third-party IAgentProvider that
+        // forwards the SDK pair raw from producing a "SDK returned success"
+        // false failure.
+        if (msg.isError && msg.errorSubtype !== 'success') {
           const subtype = msg.errorSubtype ?? 'unknown';
           const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
           getLog().error(
@@ -981,46 +1206,303 @@ async function executeNodeInternal(
             'dag.system_message_unhandled'
           );
         }
+      } else if (msg.type === 'task_started') {
+        // Subagent task spawned inside this node (Claude Task tool or
+        // inline sub-agent). Forward as a task_activity emitter event so
+        // the Web UI can render it as an expandable sub-item under the
+        // parent node in the run detail view.
+        getWorkflowEventEmitter().emit({
+          type: 'task_activity',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          taskId: msg.taskId,
+          activity: 'started',
+          ...(msg.description !== undefined ? { description: msg.description } : {}),
+          ...(msg.taskType !== undefined ? { taskType: msg.taskType } : {}),
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'task_activity',
+            step_name: node.id,
+            data: {
+              task_id: msg.taskId,
+              activity: 'started',
+              ...(msg.description !== undefined ? { description: msg.description } : {}),
+              ...(msg.taskType !== undefined ? { task_type: msg.taskType } : {}),
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+              'workflow_event_persist_failed'
+            );
+          });
+      } else if (msg.type === 'task_progress') {
+        getWorkflowEventEmitter().emit({
+          type: 'task_activity',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          taskId: msg.taskId,
+          activity: 'progress',
+          ...(msg.description !== undefined ? { description: msg.description } : {}),
+          ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+          ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+          ...(msg.lastToolName !== undefined ? { lastToolName: msg.lastToolName } : {}),
+        });
+        // task_progress fires every ~30s while a subagent is running. Persist
+        // it for the timeline view but don't log — the volume would dominate.
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'task_activity',
+            step_name: node.id,
+            data: {
+              task_id: msg.taskId,
+              activity: 'progress',
+              ...(msg.description !== undefined ? { description: msg.description } : {}),
+              ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+              ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+              ...(msg.lastToolName !== undefined ? { last_tool_name: msg.lastToolName } : {}),
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+              'workflow_event_persist_failed'
+            );
+          });
+      } else if (msg.type === 'task_notification') {
+        getWorkflowEventEmitter().emit({
+          type: 'task_activity',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          taskId: msg.taskId,
+          activity: msg.status,
+          ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+          ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'task_activity',
+            step_name: node.id,
+            data: {
+              task_id: msg.taskId,
+              activity: msg.status,
+              ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+              ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+              'workflow_event_persist_failed'
+            );
+          });
+      } else if (msg.type === 'hook_started') {
+        getWorkflowEventEmitter().emit({
+          type: 'hook_activity',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          hookId: msg.hookId,
+          hookName: msg.hookName,
+          hookEvent: msg.hookEvent,
+          activity: 'started',
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'hook_activity',
+            step_name: node.id,
+            data: {
+              hook_id: msg.hookId,
+              hook_name: msg.hookName,
+              hook_event: msg.hookEvent,
+              activity: 'started',
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
+              'workflow_event_persist_failed'
+            );
+          });
+      } else if (msg.type === 'hook_response') {
+        getWorkflowEventEmitter().emit({
+          type: 'hook_activity',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          hookId: msg.hookId,
+          hookName: msg.hookName,
+          hookEvent: msg.hookEvent,
+          activity: 'response',
+          outcome: msg.outcome,
+          ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'hook_activity',
+            step_name: node.id,
+            data: {
+              hook_id: msg.hookId,
+              hook_name: msg.hookName,
+              hook_event: msg.hookEvent,
+              activity: 'response',
+              outcome: msg.outcome,
+              ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
+              'workflow_event_persist_failed'
+            );
+          });
       }
       // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
     }
+  };
 
-    // When output_format is set and the provider returned structured_output,
-    // use it instead of the concatenated assistant text (which includes prose).
-    // Each provider normalizes its own structured output onto the result chunk —
-    // no provider-specific branching here.
-    if (nodeOptions?.outputFormat) {
+  // Build a reask prompt: the original prompt + a correction block listing the
+  // schema errors. The provider still augments with the JSON schema itself
+  // (best-effort providers add their own JSON-only instruction), so this only
+  // appends the per-attempt feedback.
+  const buildReaskPrompt = (errors: string[]): string =>
+    `${finalPrompt}\n\n--- CORRECTION ---\n` +
+    `Your previous response did not satisfy the required JSON schema: ${errors.join('; ')}. ` +
+    'Respond again with ONLY a JSON object matching the schema — no prose, no code fences.';
+
+  // Observability: log every reask; notify the user once (first reask) so a
+  // best-effort provider being auto-corrected isn't invisible.
+  const emitReask = async (attempt: number): Promise<void> => {
+    getLog().warn(
+      { nodeId: node.id, workflowRunId: workflowRun.id, attempt, maxReasks },
+      'dag.structured_output_reask'
+    );
+    if (attempt === 1) {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `⚠️ Node \`${node.id}\`: structured output didn't match the schema — asking the model to correct it (up to ${maxReasks} attempt(s)).`,
+        nodeContext
+      );
+    }
+  };
+
+  try {
+    // Validate-and-reask loop. Enforced / non-output_format nodes run exactly once
+    // (maxReasks = 0). A best-effort node whose structured output is missing or
+    // schema-invalid is re-run with the errors appended, up to maxReasks times;
+    // exhaustion (or a non-best-effort failure) throws → failed node.
+    let reaskAttempt = 0;
+    let reaskPrompt = finalPrompt;
+    // Set up the next reask attempt (increment, augment the prompt, notify).
+    const scheduleReask = async (errors: string[]): Promise<void> => {
+      reaskAttempt++;
+      reaskPrompt = buildReaskPrompt(errors);
+      await emitReask(reaskAttempt);
+    };
+    while (true) {
+      // Fresh session per reask attempt (resume only the original session on the
+      // first pass) so a prior invalid turn isn't carried forward.
+      await runStreamPass(reaskPrompt, reaskAttempt === 0 ? resumeSessionId : undefined);
+      if (nodeCostUsd !== undefined) {
+        accumulatedCostUsd = (accumulatedCostUsd ?? 0) + nodeCostUsd;
+      }
+      // Carry the running total onto nodeCostUsd every pass so the exhaustion throw
+      // paths (which jump straight to the outer catch) report cost across ALL reask
+      // attempts, not just the last pass. runStreamPass clears it next iteration.
+      nodeCostUsd = accumulatedCostUsd;
+
+      // When output_format is set and the provider returned structured_output, use
+      // it instead of the concatenated assistant text. Each provider normalizes its
+      // own structured output onto the result chunk — no provider branching here.
+      if (!nodeOptions?.outputFormat) break;
+
+      // Don't reask after an idle-timeout/abort — those are genuine failures, not
+      // validation misses; they fall through to a cause-specific throw below.
+      const canReask =
+        reaskAttempt < maxReasks && !nodeIdleTimedOut && !nodeAbortController.signal.aborted;
+
       if (structuredOutput !== undefined) {
-        try {
-          nodeOutputText =
-            typeof structuredOutput === 'string'
-              ? structuredOutput
-              : JSON.stringify(structuredOutput);
-        } catch (serializeErr) {
-          const err = serializeErr as Error;
-          throw new Error(
-            `Node '${node.id}': failed to serialize structured_output to JSON: ${err.message}`
+        // Validate against the declared schema for EVERY provider — SDK-enforced
+        // ones still bypass grammar-constrained decoding on a refusal / max_tokens
+        // truncation. Fail-SAFE on an uncompilable schema, but surface it.
+        let schemaCompileError: string | undefined;
+        const validation = validateStructuredOutput(
+          structuredOutput,
+          node.output_format ?? {},
+          compileMsg => {
+            schemaCompileError = compileMsg;
+          }
+        );
+        if (schemaCompileError !== undefined) {
+          getLog().warn(
+            { nodeId: node.id, workflowRunId: workflowRun.id, compileMsg: schemaCompileError },
+            'dag.structured_output_schema_uncompilable'
+          );
+          await safeSendMessage(
+            platform,
+            conversationId,
+            `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the structured output was NOT validated against it. Fix the schema to enforce it.`,
+            nodeContext
           );
         }
-        getLog().debug({ nodeId: node.id, streamingMode }, 'dag.structured_output_override');
-      } else {
-        // Provider did not populate structuredOutput — warn the user.
-        // If the provider detected invalid output, it already yielded a system warning.
+        if (validation.valid) {
+          try {
+            nodeOutputText =
+              typeof structuredOutput === 'string'
+                ? structuredOutput
+                : JSON.stringify(structuredOutput);
+          } catch (serializeErr) {
+            const err = serializeErr as Error;
+            throw new Error(
+              `Node '${node.id}': failed to serialize structured_output to JSON: ${err.message}`
+            );
+          }
+          getLog().debug({ nodeId: node.id, streamingMode }, 'dag.structured_output_override');
+          break;
+        }
+        // Invalid payload.
         getLog().warn(
-          { nodeId: node.id, workflowRunId: workflowRun.id },
-          'dag.structured_output_missing'
+          { nodeId: node.id, workflowRunId: workflowRun.id, errors: validation.errors },
+          'dag.structured_output_invalid'
         );
-        await safeSendMessage(
-          platform,
-          conversationId,
-          `Warning: Node '${node.id}' requested output_format but the provider did not return structured output. Downstream conditions may not evaluate correctly.`,
-          nodeContext
+        if (canReask) {
+          await scheduleReask(validation.errors);
+          continue;
+        }
+        throw new Error(
+          `Node '${node.id}': output_format declared but the provider's structured output failed schema validation: ${validation.errors.join('; ')}`
         );
       }
+
+      // No structured output at all (prose / refusal / parse miss / timeout).
+      getLog().warn(
+        { nodeId: node.id, workflowRunId: workflowRun.id },
+        'dag.structured_output_missing'
+      );
+      if (canReask) {
+        await scheduleReask(['no JSON object was found in the response']);
+        continue;
+      }
+      // Surface the real cause: a timeout/abort produces no structured output too,
+      // and reporting it as "the model replied with prose" would mislead.
+      if (nodeIdleTimedOut) {
+        throw new Error(
+          `Node '${node.id}': timed out (no output for ${String(effectiveIdleTimeout / 60000)} min) before producing the required structured output.`
+        );
+      }
+      throw new Error(
+        `Node '${node.id}': output_format declared but the provider returned no schema-valid structured output. ` +
+          'The model likely replied with prose, refused, or emitted unparseable JSON.'
+      );
     }
 
-    // If the node completed via idle timeout, log it
-    if (nodeIdleTimedOut) {
+    // Only post "completed via idle timeout" when output exists — zero-output timeout falls through to the empty-output guard below.
+    if (nodeIdleTimedOut && (nodeOutputText.trim() !== '' || structuredOutput !== undefined)) {
       getLog().warn(
         { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
         'dag_node_completed_via_idle_timeout'
@@ -1114,18 +1596,12 @@ async function executeNodeInternal(
       return { state: 'failed', output: nodeOutputText, error: creditError };
     }
 
-    // Empty assistant output is a failure for AI nodes — a provider stream
-    // that closed cleanly with zero content typically means a silent
-    // rejection or interruption that didn't produce a result.isError chunk.
-    // Bash/script/approval nodes don't reach this path; they have their
-    // own dispatch and never stream through this loop.
-    //
-    // Idle-timeout exits are exempt: the timeout warning at line 1017 has
-    // already told the user the node "completed via idle timeout"; flipping
-    // that to a failure here would directly contradict the on-screen message.
-    if (nodeOutputText.trim() === '' && structuredOutput === undefined && !nodeIdleTimedOut) {
+    // Fail for zero output: covers both silent non-timeout exits AND idle-timeout before first token (time-to-first-token exceeded the window).
+    if (nodeOutputText.trim() === '' && structuredOutput === undefined) {
       const duration = Date.now() - nodeStartTime;
-      const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
+      const emptyError = nodeIdleTimedOut
+        ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
+        : `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
       await logNodeError(logDir, workflowRun.id, node.id, emptyError);
 
@@ -1201,13 +1677,20 @@ async function executeNodeInternal(
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
+    // Capture the producer's declared field set so downstream `$node.output.field`
+    // refs can tell a declared-optional-absent field ('') from a typo (throws).
+    // Only present when output_format declares an object with `properties`.
+    const declaredFields = declaredFieldsFromSchema(node.output_format);
+
     return {
       state: 'completed',
       output: nodeOutputText,
       sessionId: newSessionId,
       costUsd: nodeCostUsd,
-      tokens: nodeTokens,
-      modelUsage: nodeModelUsage,
+      ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+      ...(declaredFields !== undefined ? { declaredFields } : {}),
+      ...(nodeResumed !== undefined ? { resumed: nodeResumed } : {}),
     };
   } catch (error) {
     const err = error as Error;
@@ -1224,6 +1707,7 @@ async function executeNodeInternal(
         output: nodeOutputText,
         error: 'Cancelled by user',
         costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
       };
     }
 
@@ -1252,12 +1736,22 @@ async function executeNodeInternal(
       error: err.message,
     });
 
-    return { state: 'failed', output: '', error: err.message, costUsd: nodeCostUsd };
+    return {
+      state: 'failed',
+      output: '',
+      error: err.message,
+      costUsd: nodeCostUsd,
+      ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+    };
   }
 }
 
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
+
+/** Threshold (bytes) above which $nodeId.output values are written to a temp file
+ *  instead of inlined as bash -c arguments, to avoid silent data corruption. */
+const NODE_OUTPUT_FILE_THRESHOLD = 32_768;
 
 /**
  * Execute a bash (shell script) DAG node.
@@ -1315,9 +1809,13 @@ async function executeBashNode(
     artifactsDir,
     baseBranch,
     docsDir,
-    issueContext
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    { shellSafe: true }
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true);
+  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const subprocessEnv: NodeJS.ProcessEnv = {
@@ -1325,6 +1823,14 @@ async function executeBashNode(
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
+    USER_MESSAGE: workflowRun.user_message,
+    ARGUMENTS: workflowRun.user_message,
+    LOOP_USER_INPUT: '',
+    LOOP_PREV_OUTPUT: '',
+    REJECTION_REASON: '',
+    CONTEXT: issueContext ?? '',
+    EXTERNAL_CONTEXT: issueContext ?? '',
+    ISSUE_CONTEXT: issueContext ?? '',
     ...(envVars ?? {}),
   };
 
@@ -1489,8 +1995,13 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv =
-    envVars && Object.keys(envVars).length > 0 ? { ...process.env, ...envVars } : undefined;
+  const subprocessEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ARTIFACTS_DIR: artifactsDir,
+    LOG_DIR: logDir,
+    BASE_BRANCH: baseBranch,
+    ...(envVars ?? {}),
+  };
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -1693,35 +2204,6 @@ async function executeScriptNode(
 }
 
 /**
- * Build SendQueryOptions from resolved provider, model, and config.
- * Uses the same nodeConfig + assistantConfig pattern as resolveNodeProviderAndModel.
- */
-function buildLoopNodeOptions(
-  provider: string,
-  model: string | undefined,
-  config: WorkflowConfig,
-  workflowLevelOptions?: WorkflowLevelOptions
-): SendQueryOptions {
-  const options: SendQueryOptions = {};
-  if (model) options.model = model;
-  if (config.envVars && Object.keys(config.envVars).length > 0) {
-    options.env = config.envVars;
-  }
-  options.assistantConfig = config.assistants[provider] ?? {};
-  // Pass workflow-level options as nodeConfig so providers can apply them
-  if (workflowLevelOptions) {
-    options.nodeConfig = {
-      effort: workflowLevelOptions.effort,
-      thinking: workflowLevelOptions.thinking,
-      sandbox: workflowLevelOptions.sandbox,
-      betas: workflowLevelOptions.betas,
-      fallbackModel: workflowLevelOptions.fallbackModel,
-    };
-  }
-  return options;
-}
-
-/**
  * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
  *
  * Key behaviors:
@@ -1737,15 +2219,14 @@ async function executeLoopNode(
   workflowRun: WorkflowRun,
   node: LoopNode,
   workflowProvider: string,
-  workflowModel: string | undefined,
+  resolvedOptions: SendQueryOptions | undefined,
   artifactsDir: string,
   logDir: string,
   baseBranch: string,
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
-  issueContext?: string,
-  workflowLevelOptions?: WorkflowLevelOptions
+  issueContext?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1775,16 +2256,11 @@ async function executeLoopNode(
     : '';
 
   let lastIterationOutput = '';
+  let lastIterationStructuredOutput: unknown;
   let loopTotalCostUsd: number | undefined;
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
-  const resolvedOptions = buildLoopNodeOptions(
-    workflowProvider,
-    workflowModel,
-    config,
-    workflowLevelOptions
-  );
-
+  let loopTotalTokens: TokenUsage | undefined;
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
@@ -1921,15 +2397,38 @@ async function executeLoopNode(
           if (msg.cost !== undefined) {
             loopTotalCostUsd = (loopTotalCostUsd ?? 0) + msg.cost;
           }
+          if (msg.tokens !== undefined) {
+            // Provider-supplied numbers — see the NaN guard rationale at the
+            // DAG-level accumulator.
+            if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
+              loopTotalTokens = {
+                input: (loopTotalTokens?.input ?? 0) + msg.tokens.input,
+                output: (loopTotalTokens?.output ?? 0) + msg.tokens.output,
+              };
+            } else {
+              getLog().warn(
+                { nodeId: node.id, tokens: msg.tokens },
+                'loop_node.usage_tokens_non_finite_ignored'
+              );
+            }
+          }
           if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
           if (msg.numTurns !== undefined) {
             loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
           }
+          if (msg.structuredOutput !== undefined) {
+            lastIterationStructuredOutput = msg.structuredOutput;
+          }
           // Fail the iteration loudly on SDK error results. Previously we broke
           // silently, producing empty output and continuing to the next iteration —
           // which made `error_during_execution` on resumed interactive loops look
-          // like a "5-second crash" that kept burning iterations (#1208).
-          if (msg.isError) {
+          // like a "5-second crash" that kept burning iterations.
+          // Exception: errorSubtype === 'success' is the Claude SDK's marker for a
+          // clean stop_sequence termination (the SDK sets is_error: true alongside
+          // subtype: 'success' to encode "non-default termination, not a failure").
+          // The Claude provider already filters this; the guard here defends
+          // against a third-party IAgentProvider that forwards the SDK pair raw.
+          if (msg.isError && msg.errorSubtype !== 'success') {
             const subtype = msg.errorSubtype ?? 'unknown';
             const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
             getLog().error(
@@ -2045,6 +2544,8 @@ async function executeLoopNode(
         output: '',
         error: `Loop iteration ${i} failed: ${err.message}`,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
       };
     }
 
@@ -2101,6 +2602,8 @@ async function executeLoopNode(
         output: '',
         error: `Loop iteration ${i} failed: ${emptyError}`,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
       };
     }
 
@@ -2109,6 +2612,7 @@ async function executeLoopNode(
       await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
     }
 
+    const prevIterationOutput = lastIterationOutput;
     lastIterationOutput = cleanOutput || fullOutput;
 
     // Check LLM completion signal — the AI decides whether the user approved.
@@ -2127,16 +2631,39 @@ async function executeLoopNode(
           artifactsDir,
           baseBranch,
           docsDir,
-          issueContext
+          issueContext,
+          undefined,
+          undefined,
+          undefined,
+          { shellSafe: true }
         );
         const substitutedBash = substituteNodeOutputRefs(
           bashPrompt,
           nodeOutputs,
-          true // escapedForBash
+          true, // escapedForBash
+          logDir
         );
-        // Stdin-fed script, not inline `-c` — see executeBashNode (E2BIG guard).
-        // Kept this branch's call semantics (no timeout/env additions from dev).
-        await execBashScript(substitutedBash, { cwd });
+        // Temp script file, not inline `-c` — see executeBashNode (E2BIG guard).
+        await execBashScript(substitutedBash, {
+          cwd,
+          timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          env: {
+            ...process.env,
+            USER_MESSAGE: workflowRun.user_message,
+            ARGUMENTS: workflowRun.user_message,
+            LOOP_USER_INPUT: i === startIteration ? (loopUserInput ?? '') : '',
+            LOOP_PREV_OUTPUT: prevIterationOutput,
+            REJECTION_REASON: '',
+            CONTEXT: issueContext ?? '',
+            EXTERNAL_CONTEXT: issueContext ?? '',
+            ISSUE_CONTEXT: issueContext ?? '',
+            // Managed per-project env vars + per-user GitHub token overrides
+            // (incl. the unconnected-user scrub) must win last, exactly as
+            // executeBashNode/executeScriptNode do — otherwise until_bash would
+            // inherit the server's ambient GH token and bypass the scrub.
+            ...(config.envVars ?? {}),
+          },
+        });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
@@ -2145,6 +2672,12 @@ async function executeLoopNode(
           getLog().warn(
             { err: bashErr, nodeId: node.id, iteration: i },
             'loop_node.until_bash_exec_error'
+          );
+        } else if (bashErr.code !== undefined) {
+          // Log non-ENOENT system errors (syntax errors, permission issues, etc.)
+          getLog().warn(
+            { err: bashErr, nodeId: node.id, iteration: i },
+            'loop_node.until_bash_unexpected_error'
           );
         }
         bashComplete = false; // non-zero exit = not complete
@@ -2227,6 +2760,11 @@ async function executeLoopNode(
         output: lastIterationOutput,
         sessionId: currentSessionId,
         costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
+        ...(lastIterationStructuredOutput !== undefined
+          ? { structuredOutput: lastIterationStructuredOutput }
+          : {}),
       };
     }
 
@@ -2282,7 +2820,13 @@ async function executeLoopNode(
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
       // in multi-node workflows. Resume correctness relies on the 'paused' DB status, not
       // on the node's output state.
-      return { state: 'completed', output: lastIterationOutput, costUsd: loopTotalCostUsd };
+      return {
+        state: 'completed',
+        output: lastIterationOutput,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
+      };
     }
   }
 
@@ -2298,6 +2842,8 @@ async function executeLoopNode(
     output: lastIterationOutput,
     error: errorMsg,
     costUsd: loopTotalCostUsd,
+    ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+    loopIterations: loop.max_iterations,
   };
 }
 
@@ -2323,7 +2869,9 @@ async function executeApprovalNode(
   config: WorkflowConfig,
   workflowLevelOptions: WorkflowLevelOptions,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  aiProfile?: ResolvedAiProfile,
+  workflowPreset?: ModelAliasPreset
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -2404,7 +2952,12 @@ async function executeApprovalNode(
       ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
     };
 
-    const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+    const {
+      provider,
+      model: resolvedNodeModel,
+      options: nodeOptions,
+      tier: resolvedTier,
+    } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
       workflowModel,
@@ -2413,7 +2966,9 @@ async function executeApprovalNode(
       conversationId,
       workflowRun.id,
       cwd,
-      workflowLevelOptions
+      workflowLevelOptions,
+      aiProfile,
+      workflowPreset
     );
 
     const output = await executeNodeInternal(
@@ -2432,7 +2987,9 @@ async function executeApprovalNode(
       nodeOutputs,
       undefined, // fresh session
       configuredCommandFolder,
-      issueContext
+      issueContext,
+      resolvedNodeModel,
+      resolvedTier
     );
 
     if (output.state === 'failed') {
@@ -2495,7 +3052,15 @@ export async function executeDagWorkflow(
   platform: IWorkflowPlatform,
   conversationId: string,
   cwd: string,
-  workflow: { name: string; nodes: readonly DagNode[] } & WorkflowLevelOptions,
+  workflow: {
+    name: string;
+    nodes: readonly DagNode[];
+    /** Workflow-level default for per-node `persist_session` (read directly here). */
+    persist_sessions?: boolean;
+    /** Raw workflow-level `model` ref — used only to derive the workflow tier
+     *  keyword for node_started attribution (resolution uses `workflowModel`). */
+    model?: string;
+  } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
   workflowModel: string | undefined,
@@ -2506,27 +3071,44 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  /** Discovery source — telemetry only (custom-vs-default + name redaction). */
+  source?: WorkflowSource,
+  aiProfile?: ResolvedAiProfile,
+  workflowPreset?: ModelAliasPreset
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
+  const workflowTier = workflow.model && isTierName(workflow.model) ? workflow.model : undefined;
   const workflowLevelOptions = {
     effort: workflow.effort,
     thinking: workflow.thinking,
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,
     sandbox: workflow.sandbox,
+    workflowTier,
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
+  // Nodes flagged `always_run: true` are excluded — they re-execute on resume
+  // and downstream consumers must see the fresh output, not the cached one.
   if (priorCompletedNodes && priorCompletedNodes.size > 0) {
+    const alwaysRunIds = new Set(workflow.nodes.filter(n => n.always_run).map(n => n.id));
+    let prepopulatedCount = 0;
     for (const [nodeId, output] of priorCompletedNodes) {
+      if (alwaysRunIds.has(nodeId)) continue;
       nodeOutputs.set(nodeId, { state: 'completed', output });
+      prepopulatedCount++;
     }
     getLog().info(
-      { workflowRunId: workflowRun.id, priorCompletedCount: priorCompletedNodes.size },
+      {
+        workflowRunId: workflowRun.id,
+        priorCompletedCount: priorCompletedNodes.size,
+        prepopulatedCount,
+        alwaysRunResumedCount: priorCompletedNodes.size - prepopulatedCount,
+      },
       'dag.workflow_resume_prepopulated'
     );
   }
@@ -2545,11 +3127,20 @@ export async function executeDagWorkflow(
   // Session threading: for sequential single-node layers, thread the session forward.
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;
-  // Note: accumulates cost/tokens for this invocation only. If this is a resume, nodes skipped
-  // from the prior run are not included — totals will reflect resumed-portion only.
+  // Note: all four usage accumulators cover this invocation only. If this is a
+  // resume, nodes skipped from the prior run are not included — cost, tokens,
+  // and loop iterations all reflect the resumed portion only.
   let totalCostUsd = 0;
-  let totalInputTokens = 0;
-  let totalOutputTokens = 0;
+  let totalTokensIn = 0;
+  let totalTokensOut = 0;
+  let totalLoopIterations = 0;
+
+  // Per-node session persistence across workflow re-runs. Scope = the DB conversation
+  // UUID. The `?? undefined` guard keeps an empty/missing conversation_id from keying
+  // every invocation to the same blank scope — persistence is simply skipped in that case.
+  // Distinct from AgentRequestOptions.persistSession (Claude SDK on-disk transcript flag).
+  const persistScopeKey: string | undefined = workflowRun.conversation_id ?? undefined;
+  const workflowPersistSessions = workflow.persist_sessions === true;
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
@@ -2563,40 +3154,67 @@ export async function executeDagWorkflow(
     const layerResults = await Promise.allSettled(
       layer.map(async (node): Promise<{ nodeId: string; output: NodeExecutionResult }> => {
         try {
-          // 0. Skip if this node completed successfully in a prior run (resume path)
+          // 0. Skip if this node completed successfully in a prior run (resume path).
+          // `always_run: true` opts the node out of resume caching — re-execute even
+          // when the prior run completed it.
           if (priorCompletedNodes?.has(node.id)) {
-            getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
-            await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
-              (err: Error) => {
-                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
-              }
-            );
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'node_skipped_prior_success',
-                step_name: node.id,
-                data: { reason: 'prior_success' },
-              })
-              .catch((err: Error) => {
-                getLog().error(
-                  { err, workflowRunId: workflowRun.id, eventType: 'node_skipped_prior_success' },
-                  'workflow_event_persist_failed'
-                );
+            if (node.always_run) {
+              getLog().info({ nodeId: node.id }, 'dag.node_always_run_resume_forced');
+              deps.store
+                .createWorkflowEvent({
+                  workflow_run_id: workflowRun.id,
+                  event_type: 'node_always_run_reset',
+                  step_name: node.id,
+                  data: { prior_output: priorCompletedNodes.get(node.id) ?? '' },
+                })
+                .catch((err: Error) => {
+                  getLog().error(
+                    { err, workflowRunId: workflowRun.id, eventType: 'node_always_run_reset' },
+                    'workflow_event_persist_failed'
+                  );
+                });
+              // falls through to re-execute the node
+            } else {
+              getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
+              await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
+                (err: Error) => {
+                  getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+                }
+              );
+              deps.store
+                .createWorkflowEvent({
+                  workflow_run_id: workflowRun.id,
+                  event_type: 'node_skipped_prior_success',
+                  step_name: node.id,
+                  data: {
+                    reason: 'prior_success',
+                    node_output: priorCompletedNodes.get(node.id) ?? '',
+                  },
+                })
+                .catch((err: Error) => {
+                  getLog().error(
+                    {
+                      err,
+                      workflowRunId: workflowRun.id,
+                      eventType: 'node_skipped_prior_success',
+                    },
+                    'workflow_event_persist_failed'
+                  );
+                });
+              const emitterPrior = getWorkflowEventEmitter();
+              emitterPrior.emit({
+                type: 'node_skipped',
+                runId: workflowRun.id,
+                nodeId: node.id,
+                nodeName: node.command ?? node.id,
+                reason: 'prior_success',
               });
-            const emitterPrior = getWorkflowEventEmitter();
-            emitterPrior.emit({
-              type: 'node_skipped',
-              runId: workflowRun.id,
-              nodeId: node.id,
-              nodeName: node.command ?? node.id,
-              reason: 'prior_success',
-            });
-            // Return the pre-populated output (already in nodeOutputs)
-            return {
-              nodeId: node.id,
-              output: nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
-            };
+              // Return the pre-populated output (already in nodeOutputs)
+              return {
+                nodeId: node.id,
+                output: nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
+              };
+            }
           }
 
           // 1. Evaluate trigger rule
@@ -2639,45 +3257,45 @@ export async function executeDagWorkflow(
               nodeOutputs
             );
             if (!conditionParsed) {
-              const parseErrMsg = `\u26a0\ufe0f Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 node skipped (fail-closed). Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
+              const parseErrMsg = `\u274c Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 run failed \u2014 fix the expression and re-run. Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
               await safeSendMessage(platform, conversationId, parseErrMsg, {
                 workflowId: workflowRun.id,
                 nodeName: node.id,
               });
               getLog().error(
                 { nodeId: node.id, when: node.when },
-                'dag_node_skipped_condition_parse_error'
+                'dag_node_failed_condition_parse_error'
               );
-              await logNodeSkip(
-                logDir,
-                workflowRun.id,
-                node.id,
-                'when_condition_parse_error'
-              ).catch((err: Error) => {
-                getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
-              });
+              await logNodeError(logDir, workflowRun.id, node.id, parseErrMsg).catch(
+                (err: Error) => {
+                  getLog().warn({ err, nodeId: node.id }, 'dag.node_error_log_write_failed');
+                }
+              );
               deps.store
                 .createWorkflowEvent({
                   workflow_run_id: workflowRun.id,
-                  event_type: 'node_skipped',
+                  event_type: 'node_failed',
                   step_name: node.id,
                   data: { reason: 'when_condition_parse_error', expr: node.when },
                 })
                 .catch((err: Error) => {
                   getLog().error(
-                    { err, workflowRunId: workflowRun.id, eventType: 'node_skipped' },
+                    { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
                     'workflow_event_persist_failed'
                   );
                 });
               const emitter = getWorkflowEventEmitter();
               emitter.emit({
-                type: 'node_skipped',
+                type: 'node_failed',
                 runId: workflowRun.id,
                 nodeId: node.id,
                 nodeName: node.command ?? node.id,
-                reason: 'when_condition_parse_error',
+                error: parseErrMsg,
               });
-              return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
+              return {
+                nodeId: node.id,
+                output: { state: 'failed' as const, output: '', error: parseErrMsg },
+              };
             }
             if (!conditionPasses) {
               getLog().info({ nodeId: node.id, when: node.when }, 'dag_node_skipped_condition');
@@ -2736,25 +3354,20 @@ export async function executeDagWorkflow(
 
           // 3b. Loop node dispatch — manages its own AI sessions and iteration
           if (isLoopNode(node)) {
-            // Resolve per-node provider/model overrides (same logic as other node types).
-            // Provider is explicit; model passes through to the SDK. Throw on an
-            // unknown provider so the outer catch below emits the standard
-            // node_failed event + user-facing message — the same path
-            // resolveNodeProviderAndModel uses for non-loop nodes.
-            const loopProvider: string = node.provider ?? workflowProvider;
-            if (!isRegisteredProvider(loopProvider)) {
-              throw new Error(
-                `Node '${node.id}': unknown provider '${loopProvider}'. Registered: ${getRegisteredProviders()
-                  .map(p => p.id)
-                  .join(', ')}`
+            const { provider: loopProvider, options: loopOptions } =
+              await resolveNodeProviderAndModel(
+                node,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset
               );
-            }
-            const loopAssistantConfig = config.assistants[loopProvider];
-            const loopModel: string | undefined =
-              node.model ??
-              (loopProvider === workflowProvider
-                ? workflowModel
-                : (loopAssistantConfig?.model as string | undefined));
 
             const output = await executeLoopNode(
               deps,
@@ -2764,15 +3377,14 @@ export async function executeDagWorkflow(
               workflowRun,
               node,
               loopProvider,
-              loopModel,
+              loopOptions,
               artifactsDir,
               logDir,
               baseBranch,
               docsDir,
               nodeOutputs,
               config,
-              issueContext,
-              workflowLevelOptions
+              issueContext
             );
             return { nodeId: node.id, output };
           }
@@ -2796,7 +3408,9 @@ export async function executeDagWorkflow(
               config,
               workflowLevelOptions,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              aiProfile,
+              workflowPreset
             );
             return { nodeId: node.id, output };
           }
@@ -2854,7 +3468,12 @@ export async function executeDagWorkflow(
           }
 
           // 4. Resolve per-node provider/model/options
-          const { provider, options: nodeOptions } = await resolveNodeProviderAndModel(
+          const {
+            provider,
+            model: resolvedNodeModel,
+            options: nodeOptions,
+            tier: resolvedTier,
+          } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
             workflowModel,
@@ -2863,14 +3482,96 @@ export async function executeDagWorkflow(
             conversationId,
             workflowRun.id,
             cwd,
-            workflowLevelOptions
+            workflowLevelOptions,
+            aiProfile,
+            workflowPreset
           );
 
           // 5. Determine session — parallel or context:fresh → always fresh
           // Parallel layers always get fresh sessions; explicit 'fresh' context also forces it.
           // 'shared' forces continuation. Default: fresh for parallel, inherited for sequential.
-          const isFresh = isParallelLayer || node.context === 'fresh';
-          const resumeSessionId = isFresh ? undefined : lastSequentialSessionId;
+          // isFreshSequential controls in-run threading (lastSequentialSessionId).
+          // bypassesPersistence (context:'fresh' only) also disables cross-run persist_session;
+          // a parallel-layer node CAN still use persist_session — it just doesn't share with siblings.
+          const isFreshSequential = isParallelLayer || node.context === 'fresh';
+          const bypassesPersistence = node.context === 'fresh';
+          let resumeSessionId: string | undefined = isFreshSequential
+            ? undefined
+            : lastSequentialSessionId;
+
+          const nodePersistFlag = 'persist_session' in node ? node.persist_session : undefined;
+          // Strictly opt-in: off unless the node sets persist_session, or the workflow
+          // sets persist_sessions and the node doesn't override it to false.
+          const effectivePersist: boolean = nodePersistFlag ?? workflowPersistSessions;
+
+          if (effectivePersist && !bypassesPersistence) {
+            // Runtime capability guard via the resolved provider instance (catches the
+            // case where provider was resolved from .archon/config.yaml defaults).
+            // Uses the instance's getCapabilities() rather than the static registry so
+            // tests can substitute mock providers with different caps without registering.
+            const caps = deps.getAgentProvider(provider).getCapabilities();
+            if (!caps.sessionResume) {
+              throw new Error(
+                `Node '${node.id}' has persist_session: true but resolved provider '${provider}' does not support sessionResume. Remove persist_session, or use a provider with sessionResume capability.`
+              );
+            }
+            if (persistScopeKey) {
+              try {
+                const persisted = await deps.store.getWorkflowNodeSession({
+                  workflow_name: workflow.name,
+                  node_id: node.id,
+                  scope_key: persistScopeKey,
+                  provider,
+                });
+                if (persisted) {
+                  resumeSessionId = persisted.provider_session_id;
+                  // workflow_events is broader-scoped and longer-lived than the
+                  // node-session table. A session ID can resume a conversation, so we
+                  // store only an 8-char prefix here — enough for observability without
+                  // leaving a resumable artifact in the event log.
+                  const sessionIdPreview = `${persisted.provider_session_id.slice(0, 8)}…`;
+                  deps.store
+                    .createWorkflowEvent({
+                      workflow_run_id: workflowRun.id,
+                      event_type: 'node_session_resumed',
+                      step_name: node.id,
+                      data: {
+                        provider,
+                        scope_key: persistScopeKey,
+                        provider_session_id_preview: sessionIdPreview,
+                      },
+                    })
+                    .catch((err: Error) => {
+                      getLog().warn(
+                        { err, nodeId: node.id },
+                        'persist_session_resumed_event_persist_failed'
+                      );
+                    });
+                }
+              } catch (err) {
+                // Non-fatal: the node still runs (fresh, no resume), but the user opted
+                // into persistence — a DB error here silently breaks continuity, so warn
+                // them as well as the logs. (A "no row" result is not an error: it returns
+                // null above and this catch never fires for it.)
+                getLog().warn(
+                  {
+                    err: err as Error,
+                    nodeId: node.id,
+                    workflow: workflow.name,
+                    scopeKey: persistScopeKey,
+                    provider,
+                  },
+                  'persist_session_lookup_failed'
+                );
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `⚠️ Could not load the persisted session for node \`${node.id}\` — it will run without prior context. Session continuity may be broken; if this recurs, check server logs or run \`/workflow reset-sessions ${workflow.name}\`.`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+              }
+            }
+          }
 
           // 6. Execute with retry for transient failures
           const retryConfig = getEffectiveNodeRetryConfig(node);
@@ -2899,7 +3600,9 @@ export async function executeDagWorkflow(
               // ensures the source is never mutated, so retries can safely resume from it.
               resumeSessionId,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              resolvedNodeModel,
+              resolvedTier
             );
 
             if (output.state !== 'failed') break;
@@ -2940,6 +3643,91 @@ export async function executeDagWorkflow(
             await new Promise(resolve => setTimeout(resolve, delayMs));
           }
 
+          // Cold-resume surfacing: this node requested a session resume but the
+          // provider reported it came back cold (resumed === false) — the prior
+          // context is gone. Every provider's cold fallback is already a clean
+          // fresh session, so the run we just completed is a valid fresh-context
+          // result; we keep it and persist its fresh session id below. Surface the
+          // lost continuity to the user (no silent failure) so a degraded run isn't
+          // mistaken for a normal resumed one — but do NOT re-run: a replay would
+          // only repeat the same fresh run at double the cost and side effects.
+          if (
+            resumeSessionId !== undefined &&
+            output.state === 'completed' &&
+            output.resumed === false
+          ) {
+            // Mask the session id: it's a resumable artifact, so log only an
+            // 8-char preview (same policy as the node_session_resumed event above).
+            getLog().warn(
+              {
+                nodeId: node.id,
+                provider,
+                workflowRunId: workflowRun.id,
+                resumeSessionId: `${resumeSessionId.slice(0, 8)}…`,
+              },
+              'dag.session_resume_failed'
+            );
+            await safeSendMessage(
+              platform,
+              conversationId,
+              `⚠️ Node \`${node.id}\`: could not resume the prior session — continued with a fresh session, so the earlier context was not restored.`,
+              { workflowId: workflowRun.id, nodeName: node.id }
+            );
+          }
+
+          // Persist (or drop) the node's provider session ID for the next run in this scope.
+          // context:'fresh' nodes are excluded (the author opted out of any cross-run memory).
+          if (
+            effectivePersist &&
+            !bypassesPersistence &&
+            persistScopeKey &&
+            output.state === 'completed'
+          ) {
+            try {
+              if (output.sessionId !== undefined) {
+                await deps.store.upsertWorkflowNodeSession({
+                  workflow_name: workflow.name,
+                  node_id: node.id,
+                  scope_key: persistScopeKey,
+                  provider,
+                  provider_session_id: output.sessionId,
+                  last_run_id: workflowRun.id,
+                });
+              } else {
+                // Provider returned no session ID (e.g. Codex with no thread ID).
+                // Drop the stale row for THIS provider only — leave other providers'
+                // rows intact so switching providers between runs doesn't clobber
+                // the other side's continuity.
+                await deps.store.deleteWorkflowNodeSessions({
+                  workflow_name: workflow.name,
+                  scope_key: persistScopeKey,
+                  node_id: node.id,
+                  provider,
+                });
+              }
+            } catch (err) {
+              // Non-fatal: persistence failure does not undo a successful node execution.
+              // But the user opted into persistence — the next run will start fresh for
+              // this node, so warn them as well as the logs.
+              getLog().warn(
+                {
+                  err: err as Error,
+                  nodeId: node.id,
+                  workflow: workflow.name,
+                  scopeKey: persistScopeKey,
+                  provider,
+                },
+                'persist_session_upsert_failed'
+              );
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `⚠️ Could not persist the session for node \`${node.id}\` (${provider}). The next run will start this node fresh.`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+            }
+          }
+
           return { nodeId: node.id, output };
         } catch (error) {
           const err = error as Error;
@@ -2976,16 +3764,56 @@ export async function executeDagWorkflow(
     );
 
     // Process layer results — store all outputs, track failures
+    const nodeById = new Map(layer.map(n => [n.id, n]));
     let layerHadFailure = false;
     for (const result of layerResults) {
       if (result.status === 'fulfilled') {
         const { nodeId, output } = result.value;
+        // SINGLE aggregation point for run-level usage telemetry. Per-node
+        // cost/tokens must be summed here and ONLY here — adding a per-node
+        // telemetry capture elsewhere would double-count against the totals
+        // sent on workflow_completed/workflow_failed.
         if (output.costUsd !== undefined) totalCostUsd += output.costUsd;
-        if (output.tokens) {
-          totalInputTokens += output.tokens.input ?? 0;
-          totalOutputTokens += output.tokens.output ?? 0;
+        if (output.tokens !== undefined) {
+          // Token values come from providers (incl. community ones) — guard so
+          // a NaN can't silently poison the totals (NaN > 0 is false, which
+          // would silently drop the fields from telemetry with no trace).
+          if (Number.isFinite(output.tokens.input) && Number.isFinite(output.tokens.output)) {
+            totalTokensIn += output.tokens.input;
+            totalTokensOut += output.tokens.output;
+          } else {
+            getLog().warn({ nodeId, tokens: output.tokens }, 'dag.usage_tokens_non_finite_ignored');
+          }
         }
+        if (output.loopIterations !== undefined) totalLoopIterations += output.loopIterations;
         nodeOutputs.set(nodeId, output);
+        // Typed artifact: when a node declares `output_type`, persist its output
+        // as a typed sidecar (nodes/<id>.md + .meta.json) so other nodes and
+        // later runs can locate it by type. Best-effort — a metadata write must
+        // never fail an otherwise-successful node.
+        const completedNode = nodeById.get(nodeId);
+        if (output.state === 'completed' && completedNode?.output_type) {
+          try {
+            await writeNodeArtifact(
+              artifactsDir,
+              {
+                nodeId,
+                outputType: completedNode.output_type,
+                runId: workflowRun.id,
+                producedAt: new Date().toISOString(),
+                // `sessionId` may be undefined (e.g. bash/script nodes have no
+                // session); writeNodeArtifact omits it from the metadata when so.
+                sessionId: output.sessionId,
+              },
+              output.output
+            );
+          } catch (err) {
+            getLog().warn(
+              { err: err as Error, nodeId, workflowRunId: workflowRun.id },
+              'artifacts.write_failed'
+            );
+          }
+        }
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
         }
@@ -3071,6 +3899,18 @@ export async function executeDagWorkflow(
   }
   const anyCompleted = nodeCounts.completed > 0;
   const anyFailed = nodeCounts.failed > 0;
+  // Categorical failure taxonomy for telemetry: type of the first failed node
+  // in stored (Map insertion) order — for parallel layers this is layer-array
+  // order, not completion order; any failed node is equally representative —
+  // plus a fixed-enum error class derived from the stored node error. Raw
+  // error text never leaves.
+  const failureTaxonomy = firstFailedNodeTaxonomy(nodeOutputs, workflow.nodes);
+  const runUsageProps = buildRunUsageProps({
+    costUsd: totalCostUsd,
+    tokensIn: totalTokensIn,
+    tokensOut: totalTokensOut,
+    loopIterations: totalLoopIterations,
+  });
 
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
@@ -3079,9 +3919,32 @@ export async function executeDagWorkflow(
 
   if (!anyCompleted) {
     if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
+    const failedNodes: string[] = [];
+    for (const [nodeId, o] of nodeOutputs) {
+      if (o.state === 'failed') failedNodes.push(nodeId);
+    }
     const failMsg =
-      `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
-      'Check node conditions, trigger rules, and upstream failures.';
+      failedNodes.length > 0
+        ? `DAG workflow '${workflow.name}' failed: node${failedNodes.length > 1 ? 's' : ''} ${failedNodes.join(', ')} failed. ` +
+          `${nodeCounts.skipped} downstream node${nodeCounts.skipped !== 1 ? 's were' : ' was'} skipped.`
+        : `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
+          'Check node conditions, trigger rules, and upstream failures.';
+    // Anonymous telemetry: terminal failure (no successful nodes). Counts/
+    // duration are in scope here even though they aren't persisted to the DB row.
+    captureWorkflowCompleted({
+      outcome: 'failed',
+      workflowName: workflow.name,
+      workflowSource: source,
+      provider: workflowProvider,
+      durationMs: Date.now() - dagStartTime,
+      nodesCompleted: nodeCounts.completed,
+      nodesFailed: nodeCounts.failed,
+      nodesSkipped: nodeCounts.skipped,
+      nodesTotal: nodeCounts.total,
+      exitReason: 'no_nodes_completed',
+      ...failureTaxonomy,
+      ...runUsageProps,
+    });
     // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
     // Frontend guards with isValidNodeCounts so missing node_counts is safe.
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
@@ -3115,6 +3978,21 @@ export async function executeDagWorkflow(
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
+    // Anonymous telemetry: terminal failure (some nodes failed).
+    captureWorkflowCompleted({
+      outcome: 'failed',
+      workflowName: workflow.name,
+      workflowSource: source,
+      provider: workflowProvider,
+      durationMs: Date.now() - dagStartTime,
+      nodesCompleted: nodeCounts.completed,
+      nodesFailed: nodeCounts.failed,
+      nodesSkipped: nodeCounts.skipped,
+      nodesTotal: nodeCounts.total,
+      exitReason: 'node_error',
+      ...failureTaxonomy,
+      ...runUsageProps,
+    });
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
@@ -3147,8 +4025,8 @@ export async function executeDagWorkflow(
     await deps.store.completeWorkflowRun(workflowRun.id, {
       node_counts: nodeCounts,
       ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-      ...(totalInputTokens > 0 ? { total_input_tokens: totalInputTokens } : {}),
-      ...(totalOutputTokens > 0 ? { total_output_tokens: totalOutputTokens } : {}),
+      ...(totalTokensIn > 0 ? { total_input_tokens: totalTokensIn } : {}),
+      ...(totalTokensOut > 0 ? { total_output_tokens: totalTokensOut } : {}),
     });
   } catch (dbErr) {
     getLog().error(
@@ -3171,6 +4049,19 @@ export async function executeDagWorkflow(
     workflowName: workflow.name,
     duration,
   });
+  // Anonymous telemetry: successful terminal run with outcome + duration + counts.
+  captureWorkflowCompleted({
+    outcome: 'completed',
+    workflowName: workflow.name,
+    workflowSource: source,
+    provider: workflowProvider,
+    durationMs: duration,
+    nodesCompleted: nodeCounts.completed,
+    nodesFailed: nodeCounts.failed,
+    nodesSkipped: nodeCounts.skipped,
+    nodesTotal: nodeCounts.total,
+    ...runUsageProps,
+  });
   deps.store
     .createWorkflowEvent({
       workflow_run_id: workflowRun.id,
@@ -3178,8 +4069,8 @@ export async function executeDagWorkflow(
       data: {
         duration_ms: duration,
         ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-        ...(totalInputTokens > 0 ? { total_input_tokens: totalInputTokens } : {}),
-        ...(totalOutputTokens > 0 ? { total_output_tokens: totalOutputTokens } : {}),
+        ...(totalTokensIn > 0 ? { total_input_tokens: totalTokensIn } : {}),
+        ...(totalTokensOut > 0 ? { total_output_tokens: totalTokensOut } : {}),
       },
     })
     .catch((err: Error) => {

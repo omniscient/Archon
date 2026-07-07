@@ -8,7 +8,7 @@
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { execFileStdinAsync } from '@archon/git';
-import type { WorkflowDeps } from './deps';
+import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
@@ -51,6 +51,8 @@ export const TRANSIENT_PATTERNS = [
   '429',
   '503',
   '502',
+  '529', // Anthropic HTTP 529 = service overloaded
+  'overloaded', // Anthropic/Minimax overload message text
   'network error',
   'socket hang up',
   'exited with code',
@@ -79,6 +81,27 @@ export function classifyError(error: Error): ErrorType {
     return 'TRANSIENT';
   }
   return 'UNKNOWN';
+}
+
+/**
+ * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
+ * telemetry event carries ONLY this fixed-enum class — never error text.
+ */
+export function toTelemetryErrorClass(errorType: ErrorType): archonPaths.WorkflowErrorClass {
+  switch (errorType) {
+    case 'FATAL':
+      return 'fatal';
+    case 'TRANSIENT':
+      return 'transient';
+    case 'UNKNOWN':
+      return 'unknown';
+    default: {
+      // Exhaustiveness guard: a future ErrorType variant fails compilation
+      // here instead of silently sending `undefined` to the telemetry wire.
+      const exhaustive: never = errorType;
+      return exhaustive;
+    }
+  }
 }
 
 // ─── Subprocess Failure Formatting ───────────────────────────────────────────
@@ -185,9 +208,16 @@ export async function execBashScript(
   return execFileStdinAsync('bash', ['-s'], script, options);
 }
 
-// ─── Credit Exhaustion Detection ────────────────────────────────────────────
+// ─── Credit/Limit Exhaustion Detection ──────────────────────────────────────
 
-/** Patterns that indicate credit/quota exhaustion in streamed assistant output */
+/** Patterns that indicate a subscription session limit in streamed assistant output */
+const SESSION_LIMIT_OUTPUT_PATTERNS = [
+  'hit your session limit',
+  'session limit reached',
+  'session limit has been reached',
+];
+
+/** Patterns that indicate pay-per-token credit exhaustion in streamed assistant output */
 const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
   "you're out of extra usage",
   'out of credits',
@@ -195,18 +225,38 @@ const CREDIT_EXHAUSTION_OUTPUT_PATTERNS = [
   'insufficient credit',
 ];
 
+/** Extract a reset-time clause from a session-limit message, e.g. "resets 3am (America/Mexico_City)". */
+function extractResetTime(text: string): string | null {
+  const match = /resets\s+([^\n·.!]+)/i.exec(text);
+  return match ? match[1].trim() : null;
+}
+
 /**
- * Detect credit exhaustion in streamed node output text.
+ * Detect credit/session-limit exhaustion in streamed node output text.
  *
- * The Claude SDK returns credit exhaustion as a normal assistant text message
- * rather than throwing. This function checks the accumulated output for known
- * credit exhaustion phrases.
+ * The Claude SDK surfaces both subscription session limits and pay-per-token
+ * credit exhaustion as normal assistant text messages rather than thrown errors.
+ * This function checks the accumulated output for known phrases and returns an
+ * actionable error string, or null if no limit is detected.
+ *
+ * @returns null if no limit detected; a session-limit string (instructs user to
+ * abandon and retry after reset) or a credit-exhaustion string (instructs user
+ * to resume when credits refill).
  */
 export function detectCreditExhaustion(text: string): string | null {
   const lower = text.toLowerCase();
+
+  if (SESSION_LIMIT_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
+    const resetTime = extractResetTime(text);
+    return resetTime
+      ? `Claude session limit reached — resets ${resetTime}. Abandon this run and retry after reset.`
+      : 'Claude session limit reached — abandon this run and retry when the session resets.';
+  }
+
   if (CREDIT_EXHAUSTION_OUTPUT_PATTERNS.some(p => lower.includes(p))) {
     return 'Credit exhaustion detected — resume when credits reset';
   }
+
   return null;
 }
 
@@ -397,7 +447,8 @@ export function substituteWorkflowVariables(
   issueContext?: string,
   loopUserInput?: string,
   rejectionReason?: string,
-  loopPrevOutput?: string
+  loopPrevOutput?: string,
+  options?: { shellSafe?: boolean }
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
@@ -411,31 +462,39 @@ export function substituteWorkflowVariables(
   const resolvedDocsDir = docsDir || 'docs/';
 
   // Substitute basic variables
+  // When shellSafe is true, skip user-controlled variables — they will be passed
+  // via subprocess environment variables instead to prevent shell injection.
   let result = prompt
     .replace(/\$WORKFLOW_ID/g, workflowId)
-    .replace(/\$USER_MESSAGE/g, userMessage)
-    .replace(/\$ARGUMENTS/g, userMessage)
     .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
     .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir)
-    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-    .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+    .replace(/\$DOCS_DIR/g, resolvedDocsDir);
+
+  if (!options?.shellSafe) {
+    result = result
+      .replace(/\$USER_MESSAGE/g, userMessage)
+      .replace(/\$ARGUMENTS/g, userMessage)
+      .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
+      .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
+      .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+  }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
 
   // Substitute or clear context variables (use fresh global regex for replace)
-  if (!issueContext && hasContextVariables) {
-    getLog().debug(
-      {
-        action: 'clearing variables',
-        variables: ['$CONTEXT', '$EXTERNAL_CONTEXT', '$ISSUE_CONTEXT'],
-      },
-      'context_variables_cleared'
-    );
+  if (!options?.shellSafe) {
+    if (!issueContext && hasContextVariables) {
+      getLog().debug(
+        {
+          action: 'clearing variables',
+          variables: ['$CONTEXT', '$EXTERNAL_CONTEXT', '$ISSUE_CONTEXT'],
+        },
+        'context_variables_cleared'
+      );
+    }
+    result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), issueContext ?? '');
   }
-  result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), issueContext ?? '');
 
   return {
     prompt: result,
@@ -556,4 +615,83 @@ export function stripCompletionTags(content: string, until?: string): string {
  */
 export function isInlineScript(script: string): boolean {
   return script.includes('\n') || /[;(){}&|<>$`"' ]/.test(script);
+}
+
+// ─── Platform Message Sending ────────────────────────────────────────────────
+
+/** Context for platform message sending */
+export interface SendMessageContext {
+  workflowId?: string;
+  nodeName?: string;
+}
+
+/** Threshold for consecutive UNKNOWN errors before aborting */
+const UNKNOWN_ERROR_THRESHOLD = 3;
+
+/** Mutable counter for tracking consecutive unknown errors across calls */
+export interface UnknownErrorTracker {
+  count: number;
+}
+
+/**
+ * Safely send a message to the platform without crashing on failure.
+ * Returns true if message was sent successfully, false otherwise.
+ * Only suppresses transient/unknown errors; fatal errors are rethrown.
+ * When unknownErrorTracker is provided, consecutive UNKNOWN errors are tracked
+ * and the workflow is aborted after UNKNOWN_ERROR_THRESHOLD consecutive failures.
+ */
+export async function safeSendMessage(
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  message: string,
+  context?: SendMessageContext,
+  metadata?: WorkflowMessageMetadata,
+  unknownErrorTracker?: UnknownErrorTracker
+): Promise<boolean> {
+  try {
+    await platform.sendMessage(conversationId, message, metadata);
+    if (unknownErrorTracker) unknownErrorTracker.count = 0;
+    return true;
+  } catch (error) {
+    const err = error as Error;
+    const errorType = classifyError(err);
+
+    getLog().error(
+      {
+        err,
+        conversationId,
+        messageLength: message.length,
+        errorType,
+        platformType: platform.getPlatformType(),
+        ...context,
+        stack: err.stack,
+      },
+      'platform_message_send_failed'
+    );
+
+    // Reset tracker on any non-UNKNOWN outcome — only *consecutive* UNKNOWN
+    // errors should trip the threshold (e.g. UNKNOWN→TRANSIENT→UNKNOWN→UNKNOWN
+    // is two separate runs, not three in a row).
+    if (unknownErrorTracker && errorType !== 'UNKNOWN') {
+      unknownErrorTracker.count = 0;
+    }
+
+    // Fatal errors should not be suppressed - they indicate configuration issues
+    if (errorType === 'FATAL') {
+      throw new Error(`Platform authentication/permission error: ${err.message}`);
+    }
+
+    // Track consecutive UNKNOWN errors - abort if threshold exceeded
+    if (errorType === 'UNKNOWN' && unknownErrorTracker) {
+      unknownErrorTracker.count++;
+      if (unknownErrorTracker.count >= UNKNOWN_ERROR_THRESHOLD) {
+        throw new Error(
+          `${String(UNKNOWN_ERROR_THRESHOLD)} consecutive unrecognized errors - aborting workflow: ${err.message}`
+        );
+      }
+    }
+
+    // Transient errors (and below-threshold unknown errors) suppressed to allow workflow to continue
+    return false;
+  }
 }

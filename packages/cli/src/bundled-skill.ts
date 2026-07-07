@@ -9,7 +9,7 @@
  */
 
 // =============================================================================
-// Skill Files (18 total)
+// Skill Files (23 total: 21 archon + 2 manage-run)
 // =============================================================================
 
 import skillMd from '../../../.claude/skills/archon/SKILL.md' with { type: 'text' };
@@ -26,10 +26,17 @@ import telegramGuide from '../../../.claude/skills/archon/guides/telegram.md' wi
 import authoringCommands from '../../../.claude/skills/archon/references/authoring-commands.md' with { type: 'text' };
 import cliCommands from '../../../.claude/skills/archon/references/cli-commands.md' with { type: 'text' };
 import dagAdvanced from '../../../.claude/skills/archon/references/dag-advanced.md' with { type: 'text' };
+import goodPractices from '../../../.claude/skills/archon/references/good-practices.md' with { type: 'text' };
 import interactiveWorkflows from '../../../.claude/skills/archon/references/interactive-workflows.md' with { type: 'text' };
+import parameterMatrix from '../../../.claude/skills/archon/references/parameter-matrix.md' with { type: 'text' };
 import repoInit from '../../../.claude/skills/archon/references/repo-init.md' with { type: 'text' };
+import troubleshooting from '../../../.claude/skills/archon/references/troubleshooting.md' with { type: 'text' };
 import variables from '../../../.claude/skills/archon/references/variables.md' with { type: 'text' };
 import workflowDag from '../../../.claude/skills/archon/references/workflow-dag.md' with { type: 'text' };
+
+// manage-run skill (focused run-management skill — separate install target)
+import manageRunSkillMd from '../../../.claude/skills/manage-run/SKILL.md' with { type: 'text' };
+import manageRunCommands from '../../../.claude/skills/manage-run/references/commands.md' with { type: 'text' };
 
 // =============================================================================
 // Export
@@ -53,8 +60,21 @@ export const BUNDLED_SKILL_FILES: Record<string, string> = {
   'references/authoring-commands.md': authoringCommands,
   'references/cli-commands.md': cliCommands,
   'references/dag-advanced.md': dagAdvanced,
+  'references/good-practices.md': goodPractices,
   'references/interactive-workflows.md': interactiveWorkflows,
+  'references/parameter-matrix.md': parameterMatrix,
   'references/repo-init.md': repoInit,
+  'references/troubleshooting.md': troubleshooting,
   'references/variables.md': variables,
   'references/workflow-dag.md': workflowDag,
+};
+
+/**
+ * Bundled manage-run skill files - relative path within .claude/skills/manage-run/ -> content.
+ * Installed into a separate `.claude/skills/manage-run/` directory (kept distinct from the
+ * broad `archon` skill so the run-management agent's context stays tiny).
+ */
+export const BUNDLED_MANAGE_RUN_SKILL_FILES: Record<string, string> = {
+  'SKILL.md': manageRunSkillMd,
+  'references/commands.md': manageRunCommands,
 };

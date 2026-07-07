@@ -172,7 +172,10 @@ when: "$nodeId.output != 'VALUE'"
 when: "$nodeId.output.field == 'VALUE'"   # JSON field access
 ```
 
-If the expression is invalid or can't be evaluated, Archon fails open — the node runs rather than silently skipping.
+Two failure modes, by design:
+
+- An **invalid/unparseable expression** (bad syntax) is fail-closed — the node is **skipped**.
+- A `$node.output.field` **reference that can't resolve** — a field not declared in the producer's `output_format` schema, or a schemaless node whose output isn't JSON or lacks that key — **fails the node** (it is not silently treated as empty). The one exception: a field the producer declared **optional** but left absent resolves to `''`. Whole-text `$node.output` never fails.
 
 ### Accessing Node Output
 
@@ -326,7 +329,7 @@ nodes:
 
 **Test with simple inputs first.** Before running your full workflow on real data, verify that each branch of a conditional routes correctly. Create a simple test input that's clearly a bug, confirm the BUG path runs. Then test with a clear feature request.
 
-**Let DAG resume handle failures.** If a long workflow fails partway through, run it again. Archon automatically skips nodes that already completed and resumes from where it left off. No `--resume` flag required.
+**Let DAG resume handle failures.** If a long workflow fails partway through, run `archon workflow run <name> --resume` (or `archon workflow resume <id>`) to skip nodes that already completed and continue from where it left off. Plain `archon workflow run` always starts fresh.
 
 ---
 

@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { mkdir, rm, writeFile, lstat, readlink } from 'fs/promises';
+import { mkdir, rm, writeFile, lstat, readlink, symlink as fsSymlink } from 'fs/promises';
 
 const isWindows = process.platform === 'win32';
 
@@ -10,8 +10,10 @@ import {
   isDocker,
   getArchonHome,
   getArchonWorkspacesPath,
+  ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
   getArchonConfigPath,
+  getCredentialKeyPath,
   getHomeWorkflowsPath,
   getHomeCommandsPath,
   getHomeScriptsPath,
@@ -35,6 +37,7 @@ import {
   resolveProjectRootFromCwd,
   ensureProjectStructure,
   createProjectSourceSymlink,
+  findMarkdownFilesRecursive,
 } from './archon-paths';
 
 /** All env vars that path functions depend on */
@@ -224,6 +227,13 @@ describe('archon-paths', () => {
       delete process.env.ARCHON_HOME;
       delete process.env.ARCHON_DOCKER;
       expect(getArchonConfigPath()).toBe(join(homedir(), '.archon', 'config.yaml'));
+    });
+  });
+
+  describe('getCredentialKeyPath', () => {
+    test('returns credential-key inside ARCHON_HOME', () => {
+      process.env.ARCHON_HOME = '/custom/archon';
+      expect(getCredentialKeyPath()).toBe(join('/custom/archon', 'credential-key'));
     });
   });
 
@@ -631,6 +641,43 @@ describe('ensureProjectStructure', () => {
   });
 });
 
+describe('ensureArchonWorkspacesPath', () => {
+  let tempArchonHome: string;
+  useEnvSnapshot();
+
+  beforeEach(async () => {
+    delete process.env.WORKSPACE_PATH;
+    delete process.env.ARCHON_DOCKER;
+    tempArchonHome = join(
+      tmpdir(),
+      `archon-paths-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    process.env.ARCHON_HOME = tempArchonHome;
+  });
+
+  afterEach(async () => {
+    await rm(tempArchonHome, { recursive: true, force: true });
+  });
+
+  test('creates the workspaces directory when missing', async () => {
+    const expected = getArchonWorkspacesPath();
+    expect(existsSync(expected)).toBe(false);
+
+    const returned = await ensureArchonWorkspacesPath();
+
+    expect(returned).toBe(expected);
+    expect((await lstat(expected)).isDirectory()).toBe(true);
+  });
+
+  test('is idempotent - safe to call twice', async () => {
+    await ensureArchonWorkspacesPath();
+    await ensureArchonWorkspacesPath();
+
+    const expected = getArchonWorkspacesPath();
+    expect((await lstat(expected)).isDirectory()).toBe(true);
+  });
+});
+
 describe('createProjectSourceSymlink', () => {
   let tempArchonHome: string;
   let tempTarget: string;
@@ -736,5 +783,103 @@ describe('createProjectSourceSymlink', () => {
     const linkPath = getProjectSourcePath('acme', 'widget');
     const stats = await lstat(linkPath);
     expect(stats.isSymbolicLink()).toBe(true);
+  });
+});
+
+describe.skipIf(isWindows)('findMarkdownFilesRecursive - symlinks', () => {
+  let tempDir: string;
+  let sourceDir: string;
+
+  beforeEach(async () => {
+    tempDir = join(
+      tmpdir(),
+      `archon-md-symlink-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    sourceDir = join(
+      tmpdir(),
+      `archon-md-symlink-source-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(tempDir, { recursive: true });
+    await mkdir(sourceDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+    await rm(sourceDir, { recursive: true, force: true });
+  });
+
+  test('finds .md file reached via symlink in the search root', async () => {
+    await writeFile(join(sourceDir, 'linked.md'), '# linked');
+    await fsSymlink(join(sourceDir, 'linked.md'), join(tempDir, 'linked.md'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+
+    expect(files).toEqual([{ commandName: 'linked', relativePath: 'linked.md' }]);
+  });
+
+  test('mixes regular files and symlinks in the same directory', async () => {
+    await writeFile(join(tempDir, 'regular.md'), '# regular');
+    await writeFile(join(sourceDir, 'linked.md'), '# linked');
+    await fsSymlink(join(sourceDir, 'linked.md'), join(tempDir, 'linked.md'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+    const commandNames = files.map(file => file.commandName).sort();
+
+    expect(commandNames).toEqual(['linked', 'regular']);
+  });
+
+  test('descends into a symlinked directory of .md files', async () => {
+    await writeFile(join(sourceDir, 'nested.md'), '# nested');
+    await fsSymlink(sourceDir, join(tempDir, 'linked-dir'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+
+    expect(files).toEqual([
+      { commandName: 'nested', relativePath: join('linked-dir', 'nested.md') },
+    ]);
+  });
+
+  test('preserves sibling symlink aliases that point to the same directory', async () => {
+    const localSourceDir = join(tempDir, 'source');
+    await mkdir(localSourceDir);
+    await writeFile(join(localSourceDir, 'foo.md'), '# foo');
+    await fsSymlink(localSourceDir, join(tempDir, 'alias'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+    const relativePaths = files.map(file => file.relativePath).sort();
+
+    expect(relativePaths).toEqual([join('alias', 'foo.md'), join('source', 'foo.md')]);
+  });
+
+  test('skips broken symlinks silently', async () => {
+    await writeFile(join(tempDir, 'regular.md'), '# regular');
+    await fsSymlink(join(sourceDir, 'missing.md'), join(tempDir, 'broken.md'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+
+    expect(files).toEqual([{ commandName: 'regular', relativePath: 'regular.md' }]);
+  });
+
+  test('does not recurse infinitely on a self-referential symlink cycle', async () => {
+    await writeFile(join(tempDir, 'root.md'), '# root');
+    await fsSymlink(tempDir, join(tempDir, 'self'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+
+    expect(files).toEqual([{ commandName: 'root', relativePath: 'root.md' }]);
+  });
+
+  test('does not recurse infinitely on a multi-level symlink cycle', async () => {
+    const firstDir = join(tempDir, 'first');
+    const secondDir = join(firstDir, 'second');
+    await mkdir(secondDir, { recursive: true });
+    await writeFile(join(secondDir, 'nested.md'), '# nested');
+    await fsSymlink(firstDir, join(secondDir, 'back-to-first'));
+
+    const files = await findMarkdownFilesRecursive(tempDir);
+
+    expect(files).toEqual([
+      { commandName: 'nested', relativePath: join('first', 'second', 'nested.md') },
+    ]);
   });
 });
